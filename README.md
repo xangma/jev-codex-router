@@ -3,6 +3,8 @@
 This fork adds **local Clef Flash routing on Apple Silicon**, using llama.cpp's
 native `/v1/systemone` endpoint. See [the Clef setup](CLEF.md) for installation,
 verification, and maintenance. The upstream Jev configuration remains available.
+For native Claude Code and existing Antigravity chats, see
+[the native Clef clients](NATIVE-CLIENTS.md).
 
 Contributing? See [CONTRIBUTING.md](CONTRIBUTING.md),
 [SECURITY.md](SECURITY.md), and the [release checklist](docs/RELEASING.md).

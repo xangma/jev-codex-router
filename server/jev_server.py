@@ -2299,6 +2299,9 @@ class Handler(BaseHTTPRequestHandler):
             config = decision_config(default_timeout=ASK_TIMEOUT)
         except ValueError as exc:
             return self._json(503, {"error": {"message": str(exc)}})
+        required = body.get("required_decision_provider")
+        if required is not None and required != config["provider"]:
+            return self._json(409, {"error": {"message": "Required decision provider is unavailable"}})
         provider = "Clef" if config["provider"] == "clef" else "Jev"
         key = load_decision_key(config)
         if not key:

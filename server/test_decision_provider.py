@@ -257,6 +257,14 @@ class ClefRoutingWorkflow(unittest.TestCase):
         self.assertEqual(self.request(path="/ask", body=body)[0], 200)
         self.assertEqual(len(DecisionEndpoint.requests), 2)
 
+    def test_required_provider_mismatch_does_not_forward_private_state(self):
+        body = {"state": "private fixture", "questions": jev.clef_questions(),
+                "required_decision_provider": "jev"}
+        status, raw = self.request(path="/ask", body=body)
+        self.assertEqual(status, 409)
+        self.assertEqual(DecisionEndpoint.requests, [])
+        self.assertNotIn("private fixture", raw.decode())
+
     def test_local_body_auth_and_choice_decode_use_only_luna_sol_questions(self):
         record = self.route()
         path, headers, body = DecisionEndpoint.requests[0]
