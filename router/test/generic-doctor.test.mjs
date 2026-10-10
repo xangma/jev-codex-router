@@ -38,6 +38,21 @@ function doctor(env) {
   return { result, report: JSON.parse(result.stdout) };
 }
 
+test("doctor respects the explicit optional skill-pack opt-out", () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "minimal-doctor-"));
+  try {
+    const env = environment(directory);
+    const baseline = doctor(env).report.checks.find((check) => check.name === "Codex skill pack");
+    assert.equal(baseline.status, "fail");
+    const optedOut = doctor({ ...env, CODEX_ROUTER_INSTALL_SKILLS: "0" }).report;
+    const check = optedOut.checks.find((entry) => entry.name === "Codex skill pack");
+    assert.equal(check.status, "ok");
+    assert.match(check.detail, /disabled by explicit profile/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("doctor reports generic readiness without endpoint or header values", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "generic-doctor-"));
   const env = environment(directory);

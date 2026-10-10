@@ -135,6 +135,24 @@ function launchdXml(value) {
     .replaceAll("'", "&apos;");
 }
 
+test("macOS service forwards explicit skill and agent-default opt-outs", () => {
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "router-minimal-service-"));
+  try {
+    const output = serviceCommand("service-macos.mjs", "darwin", testRoot, "render", "codex", root, {
+      CODEX_ROUTER_MANAGE_AGENT_DEFAULTS: "0", CODEX_ROUTER_INSTALL_SKILLS: "0",
+    });
+    for (const key of ["CODEX_ROUTER_MANAGE_AGENT_DEFAULTS", "CODEX_ROUTER_INSTALL_SKILLS"]) {
+      assert.ok(output.includes(`<key>${key}</key>\n    <string>0</string>`));
+    }
+    const defaults = serviceCommand("service-macos.mjs", "darwin", testRoot, "render", "codex", root, {
+      CODEX_ROUTER_MANAGE_AGENT_DEFAULTS: undefined, CODEX_ROUTER_INSTALL_SKILLS: undefined,
+    });
+    assert.doesNotMatch(defaults, /CODEX_ROUTER_MANAGE_AGENT_DEFAULTS|CODEX_ROUTER_INSTALL_SKILLS/);
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("background service definitions render for macOS, Linux, and Windows", () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-services-"));
   try {

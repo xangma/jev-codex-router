@@ -1686,7 +1686,9 @@ if (proxyOptIn) {
 // are read-only; the fixes re-run ./bin/install, which refreshes exactly the
 // marker-owned directories. It lives in Codex's user-skill directory and
 // describes Codex's own tools, so it is not part of a harness install.
-if (codexTarget) {
+if (codexTarget && process.env.CODEX_ROUTER_INSTALL_SKILLS === "0") {
+  add("ok", "Codex skill pack", "installation disabled by explicit profile");
+} else if (codexTarget) {
   const status = skillPackStatus(CODEX_HOME);
   const skillOperatorCommand =
     process.platform === "win32"

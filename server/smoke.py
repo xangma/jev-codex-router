@@ -3,6 +3,7 @@ import http.client
 import hashlib
 import json
 import secrets
+import os
 from pathlib import Path
 
 from healthcheck import healthy
@@ -16,7 +17,14 @@ def main():
     health = http.client.HTTPConnection("127.0.0.1", 4319, timeout=5)
     try:
         health.request("GET", "/health")
-        if json.loads(health.getresponse().read()).get("policy_version") != POLICY_VERSION:
+        health_data = json.loads(health.getresponse().read())
+        decision_provider = health_data.get("decision_provider", "jev")
+        if decision_provider not in ("jev", "clef"):
+            raise RuntimeError("unknown running decision provider")
+        expected_provider = os.environ.get("JEV_DECISION_PROVIDER")
+        if expected_provider and decision_provider != expected_provider:
+            raise RuntimeError("running decision provider differs from the requested profile")
+        if health_data.get("policy_version") != POLICY_VERSION:
             raise RuntimeError("running policy differs from checkout; reload required")
     finally:
         health.close()
@@ -62,12 +70,12 @@ def main():
                     route = entry
         if (
             not isinstance(route, dict)
-            or route.get("decision_source") != "jev"
+            or route.get("decision_source") != decision_provider
             or route.get("gate") not in ("apply", "astra_policy")
             or route.get("status") != 200
             or route.get("completion_status") != "response.completed"
         ):
-            raise RuntimeError("the request completed without a verified Jev decision; check the key and route")
+            raise RuntimeError("the request completed without a verified decision; check the provider and route")
         if route.get("model") not in TIERS or route.get("effort") not in EFFORTS:
             raise RuntimeError("the Jev decision did not report a supported model and effort")
         if response_model != route["model"]:

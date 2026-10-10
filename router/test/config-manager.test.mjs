@@ -482,6 +482,28 @@ test("config manager enables multi_agent_v2 and skips the legacy agents scalar w
   }
 });
 
+test("agent defaults opt-out removes managed settings and preserves user settings", () => {
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-agent-opt-out-"));
+  const configPath = path.join(codexHome, "config.toml");
+  try {
+    for (const CODEX_BIN of [scalarAcceptingCodex, scalarOnlyCodex]) {
+      writeFileSync(configPath, 'model = "gpt-5.5"\n[features]\nmulti_agent = true\n', { mode: 0o600 });
+      run("enable", codexHome, undefined, [], { CODEX_BIN });
+      assert.match(readFileSync(configPath, "utf8"), /codex-router-(multi-agent-v2|agent-concurrency)-managed/);
+      run("enable", codexHome, undefined, [], { CODEX_BIN, CODEX_ROUTER_MANAGE_AGENT_DEFAULTS: "0" });
+      const optedOut = readFileSync(configPath, "utf8");
+      assert.doesNotMatch(optedOut, /codex-router-(multi-agent-v2|agent-concurrency)-managed|multi_agent_v2|max_concurrent_threads_per_session/);
+      assert.match(optedOut, /^multi_agent = true$/m);
+    }
+    const userFeature = 'multi_agent_v2 = { enabled = true, max_concurrent_threads_per_session = 2 }';
+    writeFileSync(configPath, `model = "gpt-5.5"\n[features]\n${userFeature}\n`, { mode: 0o600 });
+    run("enable", codexHome, undefined, [], { CODEX_ROUTER_MANAGE_AGENT_DEFAULTS: "0" });
+    assert.ok(readFileSync(configPath, "utf8").includes(userFeature));
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
+
 test("multi_agent_v2 management is byte-idempotent around an existing features table", () => {
   const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-v2-idempotence-"));
   const configPath = path.join(codexHome, "config.toml");

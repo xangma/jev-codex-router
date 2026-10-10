@@ -7,6 +7,12 @@ and a thinking depth, applies the routing policy, then relays to the Codex
 Router's local caller edge (native session sharing enabled) — with no format
 conversion: Responses in, Responses out, SSE relayed verbatim.
 
+Jev remains the default decision provider. JEV_DECISION_PROVIDER=clef selects
+an explicit loopback System One endpoint, model and protected Clef key file.
+JEV_DECISION_TIMEOUT bounds either provider's call. JEV_BASELINE_MODEL optionally
+sets the native model used on decision failure, by the kill switch and in shadow
+mode; its default is Astra. A Clef failure never retries through hosted Jev.
+
 Routing policy: Jev independently classifies the mandatory-Astra policy, chooses
 one capability tier, one thinking depth and a bounded route lease in a single
 typed request. Code combines those answers and forces Astra for pre-project
@@ -83,15 +89,20 @@ import codecs
 import hashlib
 import hmac
 import http.client
+import ipaddress
 import json
+import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from local_runtime import (
     STATE, LocalServer, append_private, authorized, local_secret, protect_logs,
@@ -119,6 +130,82 @@ VERSION = "1.6"
 
 API = "https://api.typesafe.ai/v1/systemone"
 MODEL = "jev-latest"
+
+
+def decision_config(default_timeout=4.0):
+    """Explicit provider selection; invalid local configuration never selects Jev."""
+    provider = os.environ.get("JEV_DECISION_PROVIDER", "jev").strip().lower()
+    if provider not in ("jev", "clef"):
+        raise ValueError("JEV_DECISION_PROVIDER must be jev or clef")
+    try:
+        timeout = float(os.environ.get("JEV_DECISION_TIMEOUT", default_timeout))
+    except (TypeError, ValueError):
+        raise ValueError("JEV_DECISION_TIMEOUT must be finite and positive") from None
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("JEV_DECISION_TIMEOUT must be finite and positive")
+    baseline = os.environ.get("JEV_BASELINE_MODEL", ASTRA).strip()
+    baseline = {"luna": LUNA, "sol": SOL, "astra": ASTRA}.get(baseline, baseline)
+    if baseline not in TIERS:
+        raise ValueError("JEV_BASELINE_MODEL must select a native Luna, Sol or Astra model")
+    endpoint, model = API, MODEL
+    if provider == "clef":
+        endpoint = os.environ.get("CLEF_ENDPOINT", "").strip()
+        model = os.environ.get("CLEF_MODEL", "").strip()
+        try:
+            parsed = urllib.parse.urlsplit(endpoint)
+            address = ipaddress.ip_address(parsed.hostname or "")
+            valid = (parsed.scheme in ("http", "https") and address.is_loopback
+                     and parsed.path == "/v1/systemone" and parsed.port != 0
+                     and parsed.username is None and parsed.password is None
+                     and not parsed.query and not parsed.fragment)
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError("CLEF_ENDPOINT must be an HTTP(S) loopback IP /v1/systemone URL")
+        if not model or any(ord(ch) < 32 for ch in model):
+            raise ValueError("CLEF_MODEL must be configured")
+        if not os.environ.get("CLEF_API_KEY_FILE", "").strip():
+            raise ValueError("CLEF_API_KEY_FILE must be configured")
+    return {"provider": provider, "endpoint": endpoint, "model": model,
+            "timeout": timeout, "baseline": baseline}
+
+
+def load_clef_key():
+    """Read only Clef's explicit, owner-only raw key file; never discover Jev keys."""
+    path = os.environ.get("CLEF_API_KEY_FILE", "").strip()
+    if not path:
+        return ""
+    try:
+        fd = os.open(os.path.expanduser(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            info = os.fstat(handle.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077
+                    or info.st_uid != os.getuid()):
+                return ""
+            raw = handle.read(4097)
+            key = raw.strip()
+            if len(raw) > 4096 or any(ch.isspace() for ch in key):
+                return ""
+            return key
+    except (OSError, UnicodeError):
+        return ""
+
+
+def load_decision_key(config=None):
+    config = decision_config() if config is None else config
+    return load_clef_key() if config["provider"] == "clef" else load_key()
+
+
+def decision_health():
+    """Configuration status only: does not claim provider authentication or readiness."""
+    try:
+        config = decision_config()
+        return {"decision_provider": config["provider"], "decision_model": config["model"],
+                "decision_configured": bool(load_decision_key(config)),
+                "decision_timeout": config["timeout"], "baseline_model": config["baseline"]}
+    except ValueError as exc:
+        return {"decision_provider": "invalid", "decision_configured": False,
+                "decision_config_error": str(exc)}
 
 
 # Generic ask surface (POST /ask): a thin typed pass-through to System One for
@@ -283,11 +370,14 @@ def load_key():
 
 def warn_if_key_missing():
     """Make intentional fail-open routing visible without exposing key material."""
-    if load_key():
+    config = decision_config()
+    if load_decision_key(config):
         return False
+    provider = "Clef" if config["provider"] == "clef" else "Jev"
+    baseline = {LUNA: "luna", SOL: "sol", ASTRA: "astra"}[config["baseline"]]
     print(
-        "[jev-router] warning: no Jev API key is configured; "
-        "Jev decisions will fail open to astra",
+        f"[jev-router] warning: no {provider} API key is configured; "
+        f"{provider} decisions will fail open to {baseline}",
         file=sys.stderr,
         flush=True,
     )
@@ -609,9 +699,39 @@ def call_jev(key, state, questions=None, timeout=4.0):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def call_jev_routed(key, state, questions=None, timeout=4.0):
-    """One System One call, on the direct TypeSafe API."""
-    return call_jev(key, state, questions, timeout=timeout)
+class _NoDecisionRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def call_jev_routed(key, state, questions=None, timeout=None):
+    """One System One call to the selected provider; no cross-provider retries.
+
+    The historical key argument remains for Jev callers. Clef always reads its
+    own key file so replay tools cannot accidentally send a hosted credential.
+    """
+    config = decision_config(default_timeout=4.0 if timeout is None else timeout)
+    if config["provider"] == "jev":
+        return call_jev(key, state, questions, timeout=config["timeout"])
+    clef_key = load_clef_key()
+    if not clef_key:
+        raise ValueError("Clef API key is not configured in a protected file")
+    req = urllib.request.Request(
+        config["endpoint"],
+        data=json.dumps({"model": config["model"], "state": state,
+                         "questions": QUESTIONS if questions is None else questions}).encode(),
+        headers={"Authorization": f"Bearer {clef_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    # Local auth must not travel through an environment proxy or a redirect.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoDecisionRedirect())
+    try:
+        response = opener.open(req, timeout=config["timeout"])
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        raise
+    with response as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
 
 def validate_ask(body):
@@ -2077,15 +2197,21 @@ class Handler(BaseHTTPRequestHandler):
         state, questions, error = validate_ask(body)
         if error:
             return self._json(400, {"error": {"message": error}})
-        key = load_key()
+        try:
+            config = decision_config(default_timeout=ASK_TIMEOUT)
+        except ValueError as exc:
+            return self._json(503, {"error": {"message": str(exc)}})
+        provider = "Clef" if config["provider"] == "clef" else "Jev"
+        key = load_decision_key(config)
         if not key:
-            return self._json(503, {"error": {"message": "Jev API key is not configured"}})
+            return self._json(503, {"error": {"message": f"{provider} API key is not configured"}})
         t0 = time.time()
         try:
             answer = call_jev_routed(key, state, questions, timeout=ASK_TIMEOUT)
         except Exception:
-            return self._json(502, {"error": {"message": "Jev provider unavailable"}})
+            return self._json(502, {"error": {"message": f"{provider} provider unavailable"}})
         return self._json(200, {
+            "decision_provider": config["provider"],
             "model": answer.get("model"),
             "answers": answer.get("answers") or {},
             "usage": answer.get("usage") or {},
@@ -2095,20 +2221,24 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?", 1)[0].rstrip("/")
         if path in ("/v1/models", "/models"):
+            config = decision_health()
+            provider = config["decision_provider"]
             self._json(200, {
                 "object": "list",
                 "data": [{
                     "id": "auto",
                     "object": "model",
                     "created": 1758000000,
-                    "owned_by": "jev",
-                    "name": DISPLAY_NAME,
+                    "owned_by": provider,
+                    "name": "Auto (Clef)" if provider == "clef" else DISPLAY_NAME,
                 }],
             })
         elif path in ("/health", ""):
-            self._json(200, {"ok": True, "service": "jev-router", "version": VERSION,
+            config = decision_health()
+            self._json(200, {"ok": "decision_config_error" not in config,
+                             "service": "jev-router", "version": VERSION,
                              "policy_version": POLICY_VERSION,
-                             "auth_configured": bool(local_secret())})
+                             "auth_configured": bool(local_secret()), **config})
         else:
             self._json(404, {"error": {"message": "not found"}})
 
@@ -2143,6 +2273,9 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._body(RESPONSE_MAX_BYTES)
         if payload is None:
             return
+        config = decision_config()
+        provider = config["provider"]
+        baseline = config["baseline"]
         # Our own answer signatures never travel back upstream (see
         # strip_signatures): the model must not read its own route tag.
         stripped = strip_signatures(payload)
@@ -2164,7 +2297,7 @@ class Handler(BaseHTTPRequestHandler):
         stream_requested = payload.get("stream") is True
 
         tier = depth = conf = None
-        jev_ms = None
+        decision_ms = None
         decision = None
         jev_usage = None
         decision_source = None
@@ -2172,9 +2305,9 @@ class Handler(BaseHTTPRequestHandler):
         affinity = cache_affinity(scope, payload, signature=canonical_signature)
         leased = route_lease(scope, payload, step)
         if os.path.exists(OFF_PATH):
-            model, effort, speed, gate = ASTRA, None, "default", "off"
+            model, effort, speed, gate = baseline, None, "default", "off"
         else:
-            key = load_key()
+            key = load_decision_key(config)
             if leased is not None:
                 decision = leased
                 tier, depth, conf = (
@@ -2202,13 +2335,13 @@ class Handler(BaseHTTPRequestHandler):
                                          decision["confidence"])
                     model, effort, speed, _ = route(tier, depth)
                     gate = decision["gate"]
-                    decision_source = "jev"
+                    decision_source = provider
                 except Exception as exc:
-                    model, effort, speed, gate = ASTRA, "medium", "default", f"jev_error:{type(exc).__name__}"
+                    model, effort, speed, gate = baseline, "medium", "default", f"{provider}_error:{type(exc).__name__}"
                     decision_source = "technical_fallback"
-                jev_ms = int((time.time() - jt0) * 1000)
+                decision_ms = int((time.time() - jt0) * 1000)
             else:
-                model, effort, speed, gate = ASTRA, "medium", "default", "no_key_or_task"
+                model, effort, speed, gate = baseline, "medium", "default", "no_key_or_task"
                 decision_source = "technical_fallback"
 
         shadow_enabled = os.path.exists(SHADOW_PATH)
@@ -2216,7 +2349,8 @@ class Handler(BaseHTTPRequestHandler):
         would = None
         if shadow_enabled:
             would = {"model": model, "effort": effort, "speed": speed, "gate": gate}
-            model, effort, speed, gate = ASTRA, None, "default", "shadow(astra)"
+            label = {LUNA: "luna", SOL: "sol", ASTRA: "astra"}[baseline]
+            model, effort, speed, gate = baseline, None, "default", f"shadow({label})"
 
         # ONLY while native usage is exhausted (manual flag or observed quota
         # failure), replace the OpenAI ladder with locally discovered configured
@@ -2382,9 +2516,11 @@ class Handler(BaseHTTPRequestHandler):
             "chosen_probability": decision["chosen_probability"] if decision else None,
             "astra_policy": decision["astra_policy"] if decision else None,
             "base_tier": decision["base_model"] if decision else None,
-            "jev_usage": jev_usage,
+            "jev_usage": jev_usage if provider == "jev" else None,
+            "decision_usage": jev_usage,
             "attempts": self._attempts,
             "decision_source": decision_source,
+            "decision_provider": provider,
             "lease": decision.get("lease") if decision else None,
             "lease_hit": decision_source == "lease",
             "gate": gate,
@@ -2406,7 +2542,8 @@ class Handler(BaseHTTPRequestHandler):
             "fallback": fallback,
             "fallback_candidates": [attempt["model"] for attempt in self._attempts
                                     if attempt["model"] not in TIERS],
-            "jev_ms": jev_ms,
+            "jev_ms": decision_ms if provider == "jev" else None,
+            "decision_ms": decision_ms,
             "total_ms": int((time.time() - t0) * 1000),
             "status": status,
             "outcome_status": completed_status,
@@ -2666,11 +2803,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    # Fail before binding when a requested local profile is malformed.
+    config = decision_config()
     server = LocalServer(LISTEN, Handler)
     protect_logs([LOG_PATH, os.path.join(STATE, "jev-router-debug.jsonl"),
                   os.path.join(STATE, "jev-router-debug-stream.log")])
     warn_if_key_missing()
-    print(f"[jev-router] ready on {LISTEN[0]}:{LISTEN[1]}", flush=True)
+    print(f"[jev-router] ready on {LISTEN[0]}:{LISTEN[1]}; "
+          f"decision_provider={config['provider']}", flush=True)
     server.serve_forever()
 
 

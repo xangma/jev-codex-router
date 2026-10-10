@@ -406,6 +406,7 @@ ${managedMultiAgentV2FeatureLine()}
 // `[features]` table: this Codex build rejects a reopened `[features]` table.
 function withManagedMultiAgentV2(input) {
   const cleaned = withoutManagedMultiAgentV2(input);
+  if (process.env.CODEX_ROUTER_MANAGE_AGENT_DEFAULTS === "0") return cleaned;
   if (hasModernMultiAgentConfig(cleaned)) return cleaned;
   const scanned = scannedConfig(cleaned);
   if (!scanned) return cleaned;
@@ -486,6 +487,7 @@ function probeAgentConcurrencyScalar() {
 
 function withManagedAgentConcurrency(input) {
   const cleaned = withoutManagedAgentConcurrency(input);
+  if (process.env.CODEX_ROUTER_MANAGE_AGENT_DEFAULTS === "0") return cleaned;
   if (hasModernMultiAgentConfig(cleaned)) return cleaned;
   const scanned = scannedConfig(cleaned);
   // An optional tuning setting is never worth guessing at malformed TOML.

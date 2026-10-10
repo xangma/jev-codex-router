@@ -5,6 +5,7 @@ import {
   writeUserModels,
 } from "../router/src/user-models.mjs";
 
+const decisionName = process.env.JEV_DECISION_PROVIDER === "clef" ? "Clef" : "Jev";
 export const JEV_MODEL = Object.freeze({
   slug: "jev/auto",
   gatewayModel: "jev-auto",
@@ -12,9 +13,9 @@ export const JEV_MODEL = Object.freeze({
   upstreamModel: "auto",
   provider: "jev",
   listed: true,
-  displayName: "Auto (Jev)",
+  displayName: `Auto (${decisionName})`,
   description:
-    "Auto-routing by Jev: calls use GPT-6 Luna, GPT-6 Sol, or GPT-6 Astra at the reasoning depth they need.",
+    `Auto-routing by ${decisionName}: calls use GPT-6 Luna, GPT-6.1 Sol, or GPT-6 Astra at the reasoning depth they need.`,
   priority: 95,
   defaultEffort: "medium",
   reasoningLevels: [

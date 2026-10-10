@@ -89,6 +89,12 @@ function environmentEntries() {
     ...serviceProxyEnvironment(),
     ...serviceGrokPatchHookEnvironment(),
     ...providerApiKeyServiceEnvironment(),
+    ...(process.env.CODEX_ROUTER_MANAGE_AGENT_DEFAULTS === "0"
+      ? { CODEX_ROUTER_MANAGE_AGENT_DEFAULTS: "0" }
+      : {}),
+    ...(process.env.CODEX_ROUTER_INSTALL_SKILLS === "0"
+      ? { CODEX_ROUTER_INSTALL_SKILLS: "0" }
+      : {}),
     ...(process.env.CODEX_ROUTER_SOURCE_ROOT
       ? { CODEX_ROUTER_SOURCE_ROOT: SOURCE_ROOT }
       : {}),

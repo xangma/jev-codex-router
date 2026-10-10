@@ -15,8 +15,16 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOGDIR="$HOME/Library/Logs"
 CODEX_HOME_VALUE="${CODEX_HOME:-$HOME/.codex}"
 STATE_VALUE="${MODEL_ROUTER_STATE_DIR:-${CODEX_ROUTER_STATE_DIR:-${KIMI_CODEX_STATE_DIR:-$CODEX_HOME_VALUE/codex-router}}}"
-JEV_API_KEY_FILE_VALUE="${JEV_API_KEY_FILE-$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:JEV_API_KEY_FILE' "$PLIST" 2>/dev/null || true)}"
-JEV_ENV_FILE_VALUE="${JEV_ENV_FILE-$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:JEV_ENV_FILE' "$PLIST" 2>/dev/null || true)}"
+saved_value() {
+  [ -f "$PLIST" ] || return 0
+  local saved
+  if saved=$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:$1" "$PLIST" 2>/dev/null); then
+    printf '%s' "$saved"
+  fi
+}
+JEV_API_KEY_FILE_VALUE="${JEV_API_KEY_FILE-$(saved_value JEV_API_KEY_FILE)}"
+JEV_ENV_FILE_VALUE="${JEV_ENV_FILE-$(saved_value JEV_ENV_FILE)}"
+DECISION_PROVIDER_VALUE="${JEV_DECISION_PROVIDER-$(saved_value JEV_DECISION_PROVIDER)}"
 
 xml_escape() {
   printf '%s' "$1" |
@@ -26,8 +34,16 @@ xml_escape() {
 
 CODEX_HOME_XML="$(xml_escape "$CODEX_HOME_VALUE")"
 STATE_XML="$(xml_escape "$STATE_VALUE")"
+DECISION_ENV_XML="$(
+  for name in JEV_DECISION_PROVIDER CLEF_ENDPOINT CLEF_MODEL CLEF_API_KEY_FILE JEV_DECISION_TIMEOUT JEV_BASELINE_MODEL; do
+    value=$(printenv "$name" 2>/dev/null || saved_value "$name")
+    if [ -n "$value" ]; then
+      printf '    <key>%s</key><string>%s</string>\n' "$name" "$(xml_escape "$value")"
+    fi
+  done
+)"
 JEV_API_KEY_FILE_XML=""
-if [ -n "$JEV_API_KEY_FILE_VALUE" ]; then
+if [ "$DECISION_PROVIDER_VALUE" != clef ] && [ -n "$JEV_API_KEY_FILE_VALUE" ]; then
   [ -r "$JEV_API_KEY_FILE_VALUE" ] || { echo "Jev API key file is not readable" >&2; exit 1; }
   JEV_API_KEY_FILE_XML="$(xml_escape "$JEV_API_KEY_FILE_VALUE")"
 fi
@@ -40,6 +56,8 @@ fi
 "$PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' \
   || { echo "Python 3.11 or newer is required; set JEV_PYTHON to its executable path." >&2; exit 1; }
 mkdir -p "$LOGDIR"
+touch "$LOGDIR/jev-router.out.log" "$LOGDIR/jev-router.err.log"
+chmod 600 "$LOGDIR/jev-router.out.log" "$LOGDIR/jev-router.err.log"
 mkdir -p "$(dirname "$PLIST")"
 mkdir -p "$RUNTIME/server" "$RUNTIME/router"
 chmod 700 "$RUNTIME"
@@ -66,6 +84,7 @@ cat > "$PLIST" <<EOF
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>Umask</key><integer>63</integer>
   <key>StandardOutPath</key><string>$LOGDIR/jev-router.out.log</string>
   <key>StandardErrorPath</key><string>$LOGDIR/jev-router.err.log</string>
   <key>WorkingDirectory</key><string>$RUNTIME</string>
@@ -73,6 +92,7 @@ cat > "$PLIST" <<EOF
   <dict>
     <key>CODEX_HOME</key><string>$CODEX_HOME_XML</string>
     <key>CODEX_ROUTER_STATE_DIR</key><string>$STATE_XML</string>
+$DECISION_ENV_XML
 $(if [ -n "$JEV_API_KEY_FILE_XML" ]; then
     printf '    <key>JEV_API_KEY_FILE</key><string>%s</string>\n' "$JEV_API_KEY_FILE_XML"
   fi)
