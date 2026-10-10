@@ -68,6 +68,36 @@ class DecisionConfiguration(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True):
             self.assertEqual(jev.decision_config()["baseline"], jev.SOL)
 
+    def test_clef_caps_explicit_astra_baseline_and_new_two_choice_answers(self):
+        with mock.patch.dict(os.environ, {**clef_env(), "JEV_BASELINE_MODEL": jev.ASTRA}, clear=True):
+            self.assertEqual(jev.decision_config()["baseline"], jev.SOL)
+        answers = routing.answer(jev.SOL, "high")["answers"]
+        answers.pop("astra_policy")
+        answers["model"]["probabilities"] = {"luna": 0.1, "sol": 0.9}
+        self.assertEqual(jev.provider_decision(answers, "clef")["model"], jev.SOL)
+        old = routing.answer(jev.LUNA, "high", astra_required=True)["answers"]
+        self.assertEqual(jev.provider_decision(old, "clef")["model"], jev.SOL)
+        self.assertEqual(jev.provider_decision(old, "jev")["model"], jev.ASTRA)
+
+    def test_soft_profiles_preserve_every_model_effort_choice(self):
+        for mode, profile in jev.CLEF_MODES.items():
+            for model in jev.CLEF_MODELS:
+                for effort in jev.EFFORTS:
+                    with self.subTest(mode=mode, model=model, effort=effort):
+                        answer = routing.answer(model, effort)["answers"]
+                        decision = jev.provider_decision(answer, "clef", mode)
+                        self.assertEqual(decision["model"], model)
+                        self.assertEqual(decision["effort"], effort)
+                        self.assertEqual(jev.provider_decision(answer, "jev")["effort"], effort)
+            answers = routing.answer(jev.LUNA, profile["efforts"][0])["answers"]
+            answers["effort"]["probabilities"] = {value: int(value == profile["efforts"][0])
+                                                 for value in profile["efforts"]}
+            self.assertEqual(jev.provider_decision(answers, "clef", mode)["model"], jev.LUNA)
+            self.assertEqual(set(jev.clef_questions(mode)["effort"]["criteria"]), set(profile["efforts"]))
+            self.assertEqual(set(profile["efforts"]), set(jev.EFFORTS))
+            self.assertIn(profile["preference"], jev.clef_questions(mode)["effort"]["instructions"])
+        self.assertNotEqual(jev.clef_questions("auto-cheap"), jev.clef_questions("auto-deep"))
+
     def test_clef_key_is_explicit_protected_and_never_discovers_hosted_keys(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp, "clef.key")
@@ -177,6 +207,7 @@ class ClefRoutingWorkflow(unittest.TestCase):
         DecisionEndpoint.status = 200
         DecisionEndpoint.redirect = None
         routing.Edge.payloads = []
+        routing.Edge.headers_seen = []
 
     def tearDown(self):
         self.hosted.assert_not_called()
@@ -198,20 +229,22 @@ class ClefRoutingWorkflow(unittest.TestCase):
         with response:
             return response.status, response.read()
 
-    def route(self):
-        status, _ = self.request()
+    def route(self, body=None):
+        self.logged.clear()
+        status, _ = self.request(body=body)
         self.assertEqual(status, 200)
         self.assertTrue(self.logged.wait(3))
         return self.records[-1]
 
-    def test_local_body_auth_and_choice_decode_use_the_four_existing_questions(self):
+    def test_local_body_auth_and_choice_decode_use_only_luna_sol_questions(self):
         record = self.route()
         path, headers, body = DecisionEndpoint.requests[0]
         self.assertEqual(path, "/v1/systemone")
         self.assertEqual(headers["Authorization"], "Bearer local-fixture")
         self.assertEqual(body["model"], "clef-flash")
-        self.assertEqual(body["questions"], jev.QUESTIONS)
-        self.assertEqual(set(body["questions"]), {"model", "effort", "astra_policy", "lease"})
+        self.assertEqual(body["questions"], jev.clef_questions("auto"))
+        self.assertEqual(set(body["questions"]), {"model", "effort", "lease"})
+        self.assertEqual(set(body["questions"]["model"]["criteria"]), {"luna", "sol"})
         self.assertIn("task", body["state"])
         self.assertEqual((record["model"], record["effort"]), (jev.LUNA, "low"))
         self.assertEqual(record["decision_source"], "clef")
@@ -226,11 +259,302 @@ class ClefRoutingWorkflow(unittest.TestCase):
             answer["confidence"] = 0.01
         self.assertEqual(self.route()["model"], jev.LUNA)
 
-    def test_mandatory_astra_overrides_capability_choice_in_active_mode(self):
+    def test_all_modes_preserve_both_models_and_bound_final_replayed_effort(self):
+        for mode, profile in jev.CLEF_MODES.items():
+            for model, requested in ((jev.LUNA, "max"), (jev.SOL, "low")):
+                with self.subTest(mode=mode, model=model):
+                    DecisionEndpoint.answer = routing.answer(model, requested)
+                    update = {"type": "configuration_update", "model": jev.ASTRA,
+                              "reasoning": {"effort": "max" if requested == "low" else "low"}}
+                    body = routing.payload_for([routing.message("user", "Continue."), update],
+                                               model=mode, reasoning={"effort": "low"})
+                    record = self.route(body)
+                    sent = routing.Edge.payloads[-1]
+                    self.assertEqual(record["model"], model)
+                    self.assertEqual(record["auto_mode"], mode)
+                    self.assertIn(record["effort"], profile["efforts"])
+                    self.assertIn(sent["reasoning"]["effort"], profile["efforts"])
+                    final_update = sent["input"][-1]
+                    self.assertEqual(final_update["reasoning"]["effort"], record["effort"])
+                    self.assertNotIn("model", final_update)
+
+    def test_clef_dispatch_suppresses_nested_router_failover_and_jev_default_remains(self):
+        for mode in jev.CLEF_MODES:
+            self.route(routing.payload_for([routing.message("user", "Continue.")], model=mode))
+            self.assertEqual(routing.Edge.headers_seen[-1].get("x-codex-router-exact-route"), "1")
+        Path(jev.OFF_PATH).touch()
+        with mock.patch.dict(os.environ, {"JEV_DECISION_PROVIDER": "jev"}):
+            self.route()
+        self.assertNotIn("x-codex-router-exact-route", routing.Edge.headers_seen[-1])
+
+    def test_mode_switch_does_not_reuse_lease_and_keeps_cache_scope_shared(self):
+        DecisionEndpoint.answer = routing.answer(jev.LUNA, "max", lease="user_turn")
+        opening = [routing.message("user", "Complete this focused task.")]
+        cheap = self.route(routing.payload_for(opening, model="auto-cheap"))
+        continuation = opening + [routing.tool_call("c1"), routing.tool_step("c1", "OK")]
+        leased = self.route(routing.payload_for(continuation, model="auto-cheap"))
+        deep = self.route(routing.payload_for(continuation, model="auto-deep"))
+        self.assertEqual(leased["decision_source"], "lease")
+        self.assertEqual(deep["decision_source"], "clef")
+        self.assertEqual(len(DecisionEndpoint.requests), 2)
+        self.assertEqual(cheap["cache_scope"], deep["cache_scope"])
+        self.assertEqual((cheap["effort"], deep["effort"]), ("max", "max"))
+        self.assertNotEqual(jev._lease_contract_fingerprint({"_router_lease_mode": "auto-cheap"}),
+                            jev._lease_contract_fingerprint({"_router_lease_mode": "auto-deep"}))
+
+    def test_verified_checks_reconsider_leases_and_feed_actual_outcomes_to_clef(self):
+        DecisionEndpoint.answer = routing.answer(jev.LUNA, "low", lease="user_turn")
+        items = [routing.message("user", "Fix the failing unit test and verify it.")]
+        self.route(routing.payload_for(items))
+        initial = jev.feedback_for(jev.STATE).context("pck-thread-1")
+        self.assertIsNone(initial["recent_verification"])
+        self.assertEqual(sum(row["verified_passes"] for row in initial["route_statistics"]), 0)
+
+        for number, code in enumerate((1, 1, 0), 1):
+            call_id = f"check-{number}"
+            items += [{"type": "function_call", "name": "exec_command", "call_id": call_id,
+                       "arguments": json.dumps({"cmd": "python -m unittest"})},
+                      {"type": "function_call_output", "call_id": call_id,
+                       "output": json.dumps({"exit_code": code,
+                                             "output": "FAILED (failures=1)" if code else "Ran 1 test\nOK"})}]
+            DecisionEndpoint.answer = routing.answer(jev.SOL if code else jev.LUNA,
+                                                     "max" if code else "low", lease="user_turn")
+            record = self.route(routing.payload_for(items))
+            self.assertEqual(record["decision_source"], "clef")
+            self.assertEqual(record["verification"]["outcome"], "fail" if code else "pass")
+            context = DecisionEndpoint.requests[-1][2]["state"]["effort_policy"]["feedback"]
+            self.assertEqual(context["consecutive_failures"], number if code else 0)
+            self.assertEqual(context["recent_verification"], record["verification"])
+            self.assertEqual(sum(row["verified_failures"] for row in context["route_statistics"]), min(number, 2))
+            self.assertEqual(sum(row["verified_passes"] for row in context["route_statistics"]), int(not code))
+            self.assertEqual(record["effort"], "max" if code else "low")
+
+        requests = len(DecisionEndpoint.requests)
+        replay = self.route(routing.payload_for(items))
+        self.assertIsNone(replay["verification"])
+        self.assertEqual(replay["decision_source"], "lease")
+        self.assertEqual(len(DecisionEndpoint.requests), requests)
+
+    def test_scope_without_stable_cache_key_does_not_attribute_check_to_another_request(self):
+        self.route(routing.payload_for([routing.message("user", "Check this task.")], cache_key=""))
+        items = [routing.message("user", "Check this task."),
+                 {"type": "function_call", "name": "exec_command", "call_id": "check",
+                  "arguments": json.dumps({"cmd": "python -m unittest"})},
+                 {"type": "function_call_output", "call_id": "check",
+                  "output": json.dumps({"exit_code": 1, "output": "FAILED (failures=1)"})}]
+        record = self.route(routing.payload_for(items, cache_key=""))
+        self.assertIsNone(record["verification"])
+        context = DecisionEndpoint.requests[-1][2]["state"]["effort_policy"]["feedback"]
+        self.assertEqual(context["consecutive_failures"], 0)
+        self.assertEqual(sum(row["verified_failures"] for row in context["route_statistics"]), 0)
+
+    def test_fast_tool_result_waits_for_preceding_route_record(self):
+        from contextlib import contextmanager
+        store = jev.feedback_for(jev.STATE)
+        original_record, original_handoff = store.record, store.handoff
+        recording, release, next_handoff = threading.Event(), threading.Event(), threading.Event()
+        finished = threading.Event()
+        original_log = jev.log_line
+        calls = 0
+
+        def delayed_record(*args):
+            recording.set()
+            self.assertTrue(release.wait(3))
+            return original_record(*args)
+
+        def finished_log(entry):
+            original_log(entry)
+            if entry.get("verification"):
+                finished.set()
+
+        @contextmanager
+        def observed_handoff(scope):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                next_handoff.set()
+            with original_handoff(scope):
+                yield
+
+        opening = [routing.message("user", "Check this unit test.")]
+        continuation = opening + [
+            {"type": "function_call", "name": "exec_command", "call_id": "fast-check",
+             "arguments": json.dumps({"cmd": "python -m unittest"})},
+            {"type": "function_call_output", "call_id": "fast-check",
+             "output": json.dumps({"exit_code": 1, "output": "FAILED (failures=1)"})}]
+        result = []
+        with mock.patch.object(store, "record", side_effect=delayed_record), \
+             mock.patch.object(store, "handoff", side_effect=observed_handoff), \
+             mock.patch.object(jev, "log_line", side_effect=finished_log):
+            self.assertEqual(self.request(body=routing.payload_for(opening))[0], 200)
+            self.assertTrue(recording.wait(3))
+            thread = threading.Thread(target=lambda: result.append(
+                self.request(body=routing.payload_for(continuation))))
+            thread.start()
+            try:
+                self.assertTrue(next_handoff.wait(3))
+                self.assertEqual(result, [])
+                self.assertEqual(len(DecisionEndpoint.requests), 1)
+            finally:
+                release.set()
+                thread.join(3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result[0][0], 200)
+            self.assertTrue(finished.wait(3))
+        context = DecisionEndpoint.requests[-1][2]["state"]["effort_policy"]["feedback"]
+        self.assertEqual(context["recent_verification"]["attributed_route"],
+                         {"model": jev.LUNA, "effort": "low"})
+        self.assertEqual(sum(row["verified_failures"] for row in context["route_statistics"]), 1)
+
+    def test_disconnected_error_response_still_records_attempt_cost(self):
+        store = jev.feedback_for(jev.STATE)
+        handler = object.__new__(jev.Handler)
+        handler.path = "/v1/responses"
+        handler._body = lambda _: routing.payload_for([routing.message("user", "Continue.")])
+
+        def disconnected(payload, config, path):
+            handler._attempts.append({"model": jev.LUNA, "effort": "low", "usage": {"input_tokens": 7},
+                                      "latency_ms": 12, "completion": "http_error"})
+            raise BrokenPipeError("disconnected")
+
+        handler._route_payload = disconnected
+        with self.assertRaises(BrokenPipeError):
+            handler._post()
+        row = store.context(None)["route_statistics"][0]
+        self.assertEqual(row["samples"], 1)
+        self.assertEqual(row["token_totals"]["input_tokens"], 7)
+        self.assertEqual(row["latency_ms_total"], 12)
+        self.assertEqual(row["verified_passes"], 0)
+
+    def test_leased_effort_and_baseline_paths_are_bounded_in_each_mode(self):
+        for mode, profile in jev.CLEF_MODES.items():
+            body = routing.payload_for([routing.message("user", "Continue.")], model=mode,
+                                       reasoning={"effort": "max"})
+            decision = jev.decision_from_answers(routing.answer(jev.SOL, "max")["answers"])
+            with self.subTest(mode=mode, path="lease"), mock.patch.object(jev, "route_lease", return_value=decision):
+                self.assertIn(self.route(body)["effort"], profile["efforts"])
+            with self.subTest(mode=mode, path="error"):
+                DecisionEndpoint.status = 503
+                self.assertIn(self.route(body)["effort"], profile["efforts"])
+                DecisionEndpoint.status = 200
+            for sentinel in (jev.OFF_PATH, jev.SHADOW_PATH):
+                with self.subTest(mode=mode, path=sentinel):
+                    Path(sentinel).touch()
+                    record = self.route(body)
+                    Path(sentinel).unlink()
+                    self.assertEqual(record["model"], jev.SOL)
+                    self.assertIn(record["effort"], profile["efforts"])
+
+    def test_empty_recovery_and_quota_retry_bound_every_attempt(self):
+        for mode, profile in jev.CLEF_MODES.items():
+            for failure in ("empty_completion", "quota"):
+                with self.subTest(mode=mode, failure=failure):
+                    served = []
+
+                    def forward(handler, payload, path, stream, debug, marker, model, signature, effort,
+                                exact_route=False):
+                        served.append((model, effort, payload["reasoning"]["effort"], exact_route))
+                        first = len(served) == 1
+                        status = (429 if failure == "quota" else 502) if first else 200
+                        handler._attempts.append({"model": model, "status": status,
+                                                  "completion": failure if first else "response.completed",
+                                                  "terminal_type": None if first else "response.completed"})
+                        return status, "json", "application/json", first and failure == "quota", b"{}", None
+
+                    DecisionEndpoint.answer = routing.answer(jev.LUNA, "max")
+                    body = routing.payload_for([routing.message("user", "Continue.")], model=mode)
+                    with mock.patch.object(jev.Handler, "_forward", new=forward), \
+                         mock.patch.object(jev, "fallback_candidates", return_value=[jev.SOL]):
+                        record = self.route(body)
+                    self.assertEqual([model for model, _, _, _ in served], [jev.LUNA, jev.SOL])
+                    self.assertTrue(all(effort in profile["efforts"] and base in profile["efforts"]
+                                        for _, effort, base, _ in served))
+                    self.assertTrue(all(exact_route for _, _, _, exact_route in served))
+                    self.assertIn(record["effort"], profile["efforts"])
+
+    def test_models_surface_and_health_describe_three_modes(self):
+        status, raw = self.request("/v1/models")
+        self.assertEqual(status, 200)
+        entries = json.loads(raw)["data"]
+        self.assertEqual({entry["id"] for entry in entries}, set(jev.CLEF_MODES))
+        self.assertEqual({entry["name"] for entry in entries},
+                         {"Auto Cheap (Clef)", "Auto Standard (Clef)", "Auto Deep (Clef)"})
+        _, raw = self.request("/health")
+        self.assertEqual(json.loads(raw)["auto_modes"]["auto"]["efforts"], list(jev.EFFORTS))
+        self.assertEqual(json.loads(raw)["effort_policy"], "adaptive-v1")
+
+    def test_historical_mandatory_astra_is_capped_to_sol_in_active_mode(self):
         DecisionEndpoint.answer = routing.answer(jev.LUNA, "high", astra_required=True)
         record = self.route()
-        self.assertEqual((record["model"], record["effort"]), (jev.ASTRA, "high"))
+        self.assertEqual((record["model"], record["effort"]), (jev.SOL, "high"))
+        self.assertEqual(record["gate"], "clef_sol_ceiling")
         self.assertEqual(record["decision_source"], "clef")
+
+    def test_historical_astra_lease_is_capped_without_a_new_decision(self):
+        decision = jev.decision_from_answers(routing.answer(jev.ASTRA, "high")["answers"])
+        with mock.patch.object(jev, "route_lease", return_value=decision):
+            record = self.route()
+        self.assertEqual(record["model"], jev.SOL)
+        self.assertEqual(record["decision_source"], "lease")
+        self.assertEqual(DecisionEndpoint.requests, [])
+
+    def test_replayed_configuration_updates_cannot_reintroduce_astra(self):
+        DecisionEndpoint.answer = routing.answer(jev.SOL, "high")
+        reasoning_update = {"type": "configuration_update", "model": jev.ASTRA,
+                            "reasoning": {"effort": "high"}}
+        model_only_update = {"type": "configuration_update", "model": jev.ASTRA}
+        body = routing.payload_for([reasoning_update, model_only_update,
+                                    routing.message("user", "Continue this work.")])
+        status, _ = self.request(body=body)
+        self.assertEqual(status, 200)
+        self.assertTrue(self.logged.wait(3))
+        sent = routing.Edge.payloads[-1]
+        self.assertEqual(sent["model"], jev.SOL)
+        self.assertEqual(sent["input"][0], {"type": "configuration_update", "reasoning": {"effort": "high"}})
+        self.assertEqual(len(sent["input"]), 2)
+        self.assertNotIn(jev.ASTRA, json.dumps(sent))
+
+    def test_empty_completion_retry_uses_sol_and_never_astra(self):
+        served = []
+
+        def forward(handler, payload, path, stream, debug, marker, model, signature, effort,
+                    exact_route=False):
+            served.append(model)
+            handler._attempts.append({"model": model, "status": 502 if len(served) == 1 else 200,
+                                      "completion": "empty_completion" if len(served) == 1 else "response.completed",
+                                      "terminal_type": None if len(served) == 1 else "response.completed"})
+            return (502 if len(served) == 1 else 200, "json", "application/json", False, b"{}", None)
+
+        with mock.patch.object(jev.Handler, "_forward", new=forward):
+            record = self.route()
+        self.assertEqual(served, [jev.LUNA, jev.SOL])
+        self.assertEqual(record["model"], jev.SOL)
+        self.assertEqual(record["gate"], "empty_completion_retry")
+
+    def test_quota_fallback_rejects_astra_and_opaque_aliases(self):
+        with mock.patch.object(jev, "native_dry", return_value="manual"), \
+             mock.patch.object(jev, "fallback_candidates", return_value=[jev.ASTRA, "provider/alias"]):
+            status, _ = self.request()
+        self.assertEqual(status, 503)
+        self.assertTrue(self.logged.wait(3))
+        self.assertEqual(self.records[-1]["attempts"], [])
+        self.assertEqual(routing.Edge.payloads, [])
+
+    def test_quota_retry_cannot_reintroduce_astra(self):
+        served = []
+
+        def forward(handler, payload, path, stream, debug, marker, model, signature, effort,
+                    exact_route=False):
+            served.append(model)
+            handler._attempts.append({"model": model, "status": 429, "completion": "quota"})
+            return 429, "json", "application/json", True, b"{}", None
+
+        with mock.patch.object(jev.Handler, "_forward", new=forward), \
+             mock.patch.object(jev, "fallback_candidates", return_value=[jev.ASTRA, "provider/alias"]):
+            status, _ = self.request()
+        self.assertEqual(status, 429)
+        self.assertTrue(self.logged.wait(3))
+        self.assertEqual(served, [jev.LUNA])
 
     def test_bad_schema_and_provider_error_use_sol_medium_without_hosted_retry(self):
         for status, answer in ((200, {"answers": {"model": {"choice": "invalid"}}}),
@@ -273,12 +597,13 @@ class ClefRoutingWorkflow(unittest.TestCase):
         record = self.route()
         self.assertEqual(record["model"], jev.SOL)
         self.assertEqual(record["gate"], "shadow(sol)")
-        self.assertEqual(record["would"]["model"], jev.ASTRA)
+        self.assertEqual(record["would"]["model"], jev.SOL)
         self.assertEqual(record["decision_source"], "clef")
 
     def test_off_uses_configured_baseline_without_decision(self):
         Path(jev.OFF_PATH).touch()
-        record = self.route()
+        with mock.patch.dict(os.environ, {"JEV_BASELINE_MODEL": jev.ASTRA}):
+            record = self.route()
         self.assertEqual(record["model"], jev.SOL)
         self.assertEqual(record["gate"], "off")
         self.assertEqual(DecisionEndpoint.requests, [])
@@ -293,6 +618,7 @@ class ClefRoutingWorkflow(unittest.TestCase):
         self.assertEqual(health["decision_provider"], "clef")
         self.assertEqual(health["decision_model"], "clef-flash")
         self.assertEqual(health["baseline_model"], jev.SOL)
+        self.assertEqual(health["allowed_execution_models"], [jev.LUNA, jev.SOL])
         self.assertTrue(health["decision_configured"])
         count = len(DecisionEndpoint.requests)
         status, _ = self.request("/ask", {}, authorization=None)

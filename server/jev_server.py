@@ -107,6 +107,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from local_runtime import (
     STATE, LocalServer, append_private, authorized, local_secret, protect_logs,
 )
+from adaptive_feedback import feedback_for
 
 from routing_policy import (ASTRA, EFFORTS, LUNA, NATIVE_MODELS, POLICY_VERSION, QUESTIONS, SOL, TERRA,
                             TIERS, decision_from_answers, route)
@@ -130,6 +131,82 @@ VERSION = "1.6"
 
 API = "https://api.typesafe.ai/v1/systemone"
 MODEL = "jev-latest"
+CLEF_MODELS = (LUNA, SOL)
+CLEF_MODES = {
+    "auto-cheap": {"name": "Cheap", "efforts": EFFORTS,
+                   "preference": "Prefer low effort. Spend more only when difficulty, uncertainty or failed checks justify it."},
+    "auto": {"name": "Standard", "efforts": EFFORTS,
+             "preference": "Balance effort against the difficulty and uncertainty of the next decision."},
+    "auto-deep": {"name": "Deep", "efforts": EFFORTS,
+                  "preference": "Favour careful reasoning on difficult decisions. Use low effort for trivial work and routine execution."},
+}
+CLEF_QUESTIONS = {
+    "model": {
+        **QUESTIONS["model"],
+        "instructions": (
+            "Choose the least costly sufficient model for remaining work. Only Luna and Sol "
+            "are allowed. Use Sol for architecture, final or risk-focused review, unresolved "
+            "diagnosis and substantial coding; Luna handles clear, low-risk focused work. "
+            "Judge remaining work, not completed phases. Cache is secondary to capability."
+        ),
+        "criteria": {
+            "luna": QUESTIONS["model"]["criteria"]["luna"],
+            "sol": (
+                "GPT-6.1 Sol: highest allowed capability; complex coding, investigation, "
+                "architecture, final and risk-focused review, and substantial synthesis."
+            ),
+        },
+    },
+    "effort": QUESTIONS["effort"],
+    "lease": QUESTIONS["lease"],
+}
+
+
+def clef_effort(mode, effort):
+    """Validate effort without imposing a profile floor or ceiling."""
+    return effort if effort in EFFORTS else "medium"
+
+
+def clef_questions(mode="auto"):
+    question = CLEF_QUESTIONS["effort"]
+    allowed = CLEF_MODES[mode]["efforts"]
+    return {**CLEF_QUESTIONS, "effort": {
+        **question, "instructions": question["instructions"] + " " + CLEF_MODES[mode]["preference"] + (
+            " This is a preference, not a minimum or maximum. Use the lowest sufficient effort "
+            "for remaining work. Consider effort_policy.feedback: repeated failed checks can "
+            "justify deeper diagnosis; passing checks and routine next steps can justify less. "
+            "Tool or network failures alone do not establish a reasoning failure. Route statistics "
+            "are observed costs and check counts, not calibrated success probabilities; "
+            "compare similar work and account for cached context."
+        ),
+        "criteria": {effort: question["criteria"][effort] for effort in allowed},
+    }}
+
+
+def execution_decision(decision, provider, mode="auto"):
+    """Clef's explicit user ceiling applies to old leases and old policy answers too."""
+    if provider == "clef":
+        decision = {**decision, "effort": clef_effort(mode, decision["effort"])}
+        if decision["model"] == ASTRA:
+            decision.update(model=SOL, requested_model=ASTRA, gate="clef_sol_ceiling")
+    return decision
+
+
+def provider_decision(answers, provider, mode="auto"):
+    if provider == "clef" and isinstance(answers, dict):
+        answers = {**answers}
+        answers.setdefault("astra_policy", {"choice": "normal"})
+        model = answers.get("model")
+        if isinstance(model, dict) and isinstance(model.get("probabilities"), dict):
+            probabilities = model["probabilities"]
+            if set(probabilities) == {"luna", "sol"}:
+                answers["model"] = {**model, "probabilities": {**probabilities, "astra": 0}}
+        effort = answers.get("effort")
+        if isinstance(effort, dict) and isinstance(effort.get("probabilities"), dict):
+            probabilities = effort["probabilities"]
+            if set(probabilities) == set(CLEF_MODES[mode]["efforts"]):
+                answers["effort"] = {**effort, "probabilities": {key: probabilities.get(key, 0) for key in EFFORTS}}
+    return execution_decision(decision_from_answers(answers), provider, mode)
 
 
 def decision_config(default_timeout=4.0):
@@ -147,6 +224,8 @@ def decision_config(default_timeout=4.0):
     baseline = {"luna": LUNA, "sol": SOL, "astra": ASTRA}.get(baseline, baseline)
     if baseline not in TIERS:
         raise ValueError("JEV_BASELINE_MODEL must select a native Luna, Sol or Astra model")
+    if provider == "clef" and baseline == ASTRA:
+        baseline = SOL
     endpoint, model = API, MODEL
     if provider == "clef":
         endpoint = os.environ.get("CLEF_ENDPOINT", "").strip()
@@ -202,7 +281,10 @@ def decision_health():
         config = decision_config()
         return {"decision_provider": config["provider"], "decision_model": config["model"],
                 "decision_configured": bool(load_decision_key(config)),
-                "decision_timeout": config["timeout"], "baseline_model": config["baseline"]}
+                "decision_timeout": config["timeout"], "baseline_model": config["baseline"],
+                "allowed_execution_models": list(CLEF_MODELS if config["provider"] == "clef" else TIERS),
+                **({"auto_modes": CLEF_MODES, "effort_policy": "adaptive-v1"}
+                   if config["provider"] == "clef" else {})}
     except ValueError as exc:
         return {"decision_provider": "invalid", "decision_configured": False,
                 "decision_config_error": str(exc)}
@@ -719,7 +801,7 @@ def call_jev_routed(key, state, questions=None, timeout=None):
     req = urllib.request.Request(
         config["endpoint"],
         data=json.dumps({"model": config["model"], "state": state,
-                         "questions": QUESTIONS if questions is None else questions}).encode(),
+                         "questions": clef_questions() if questions is None else questions}).encode(),
         headers={"Authorization": f"Bearer {clef_key}", "Content-Type": "application/json"},
         method="POST",
     )
@@ -1311,6 +1393,8 @@ def _lease_contract_fingerprint(payload):
         "context_management": payload.get("context_management"),
         "checkpoints": checkpoints,
     }
+    if "_router_lease_mode" in payload:
+        contract["auto_mode"] = payload["_router_lease_mode"]
     try:
         encoded = json.dumps(
             contract, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -2226,12 +2310,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {
                 "object": "list",
                 "data": [{
-                    "id": "auto",
+                    "id": model_id,
                     "object": "model",
                     "created": 1758000000,
                     "owned_by": provider,
-                    "name": "Auto (Clef)" if provider == "clef" else DISPLAY_NAME,
-                }],
+                    "name": f"Auto {CLEF_MODES[model_id]['name']} (Clef)" if provider == "clef" else DISPLAY_NAME,
+                } for model_id in (CLEF_MODES if provider == "clef" else ("auto",))],
             })
         elif path in ("/health", ""):
             config = decision_health()
@@ -2276,6 +2360,37 @@ class Handler(BaseHTTPRequestHandler):
         config = decision_config()
         provider = config["provider"]
         baseline = config["baseline"]
+        mode = payload.get("model", "auto") if provider == "clef" else None
+        if provider == "clef" and mode not in CLEF_MODES:
+            return self._json(400, {"error": {"message": "unsupported Clef Auto mode"}})
+        self._feedback = feedback_for(STATE) if mode is not None else None
+        self._feedback_scope = None
+        self._feedback_attempt_count = 0
+        self._attempts = []
+        if self._feedback is None:
+            return self._route_payload(payload, config, path)
+        if isinstance(payload.get("prompt_cache_key"), str) and payload["prompt_cache_key"].strip():
+            self._feedback_scope = cache_scope(payload, extract(payload)[0])
+        # A client can send its next result as soon as it sees completion,
+        # before the previous handler has finished recording its route.
+        with self._feedback.handoff(self._feedback_scope):
+            try:
+                return self._route_payload(payload, config, path)
+            finally:
+                self._record_feedback_attempts()
+
+    def _record_feedback_attempts(self):
+        if self._feedback is None:
+            return
+        for attempt in self._attempts[self._feedback_attempt_count:]:
+            self._feedback.record(self._feedback_scope, attempt.get("model"), attempt.get("effort"),
+                                  attempt.get("usage"), attempt.get("latency_ms"),
+                                  attempt.get("completion"))
+            self._feedback_attempt_count += 1
+
+    def _route_payload(self, payload, config, path):
+        provider, baseline = config["provider"], config["baseline"]
+        mode = payload.get("model", "auto") if provider == "clef" else None
         # Our own answer signatures never travel back upstream (see
         # strip_signatures): the model must not read its own route tag.
         stripped = strip_signatures(payload)
@@ -2302,14 +2417,24 @@ class Handler(BaseHTTPRequestHandler):
         jev_usage = None
         decision_source = None
         scope = cache_scope(payload, task)
+        lease_scope = f"{scope}:clef:{mode}" if mode is not None else scope
+        lease_payload = {**payload, "_router_lease_mode": mode} if mode is not None else payload
+        feedback, feedback_scope = self._feedback, self._feedback_scope
+        verification = feedback.observe(feedback_scope, payload) if feedback is not None else None
+        if verification is not None:
+            # A new check outcome changes the decision even on a clean tool chain.
+            with _route_lease_lock:
+                for profile in CLEF_MODES:
+                    _route_leases.pop(f"{scope}:clef:{profile}", None)
+        adaptive_context = feedback.context(feedback_scope) if feedback is not None else None
         affinity = cache_affinity(scope, payload, signature=canonical_signature)
-        leased = route_lease(scope, payload, step)
+        leased = route_lease(lease_scope, lease_payload, step)
         if os.path.exists(OFF_PATH):
             model, effort, speed, gate = baseline, None, "default", "off"
         else:
             key = load_decision_key(config)
             if leased is not None:
-                decision = leased
+                decision = execution_decision(leased, provider, mode)
                 tier, depth, conf = (
                     decision["model"], decision["effort"], decision["confidence"]
                 )
@@ -2319,12 +2444,18 @@ class Handler(BaseHTTPRequestHandler):
             elif key and (task or step.get("digest") or signals.get("has_image")):
                 jt0 = time.time()
                 state = jev_state(task, prev_assistant, signals, step, affinity)
+                if mode is not None:
+                    state["effort_policy"] = {
+                        "mode": mode, "preference": CLEF_MODES[mode]["preference"],
+                        "feedback": adaptive_context,
+                    }
                 failure_evidence = route_failure_evidence(scope, payload)
                 if failure_evidence:
                     state["recent_route_failure"] = failure_evidence
                 try:
-                    result = call_jev_routed(key, state)
-                    decision = decision_from_answers(result.get("answers"))
+                    result = (call_jev_routed(key, state, clef_questions(mode))
+                              if mode is not None else call_jev_routed(key, state))
+                    decision = provider_decision(result.get("answers"), provider, mode)
                     raw_usage = result.get("usage") or {}
                     if not isinstance(raw_usage, dict):
                         raw_usage = {}
@@ -2344,6 +2475,9 @@ class Handler(BaseHTTPRequestHandler):
                 model, effort, speed, gate = baseline, "medium", "default", "no_key_or_task"
                 decision_source = "technical_fallback"
 
+        if mode is not None:
+            effort = clef_effort(mode, effort or (payload.get("reasoning") or {}).get("effort"))
+
         shadow_enabled = os.path.exists(SHADOW_PATH)
 
         would = None
@@ -2351,6 +2485,8 @@ class Handler(BaseHTTPRequestHandler):
             would = {"model": model, "effort": effort, "speed": speed, "gate": gate}
             label = {LUNA: "luna", SOL: "sol", ASTRA: "astra"}[baseline]
             model, effort, speed, gate = baseline, None, "default", f"shadow({label})"
+            if mode is not None:
+                effort = clef_effort(mode, (payload.get("reasoning") or {}).get("effort"))
 
         # ONLY while native usage is exhausted (manual flag or observed quota
         # failure), replace the OpenAI ladder with locally discovered configured
@@ -2359,8 +2495,16 @@ class Handler(BaseHTTPRequestHandler):
         native_model = model
         fallback_plan = []
         no_fallback = False
+
+        def permitted_fallbacks():
+            candidates = fallback_candidates(native_model, payload)
+            # An opaque configured alias could resolve to Astra. Clef's hard
+            # user ceiling permits only the two explicit native model IDs.
+            return ([candidate for candidate in candidates if candidate in CLEF_MODELS]
+                    if provider == "clef" else candidates)
+
         if dry_reason and model in TIERS:
-            fallback_plan = fallback_candidates(native_model, payload)
+            fallback_plan = permitted_fallbacks()
             if fallback_plan:
                 model = fallback_plan.pop(0)
                 effort = tandem_effort(effort, native_model)
@@ -2372,6 +2516,8 @@ class Handler(BaseHTTPRequestHandler):
 
         # Display the model actually serving the request, including shadow and
         # operational fallbacks, rather than a hypothetical classification.
+        if mode is not None:
+            effort = clef_effort(mode, effort)
         shown = {"model": model, "effort": effort or (payload.get("reasoning") or {}).get("effort")}
         marker = route_marker(shown["model"], shown["effort"])
         signature = presentation_signature(payload, shown)
@@ -2384,14 +2530,43 @@ class Handler(BaseHTTPRequestHandler):
 
         def apply_route(model, effort):
             nonlocal applied_updates, effort_transport
+            if provider == "clef" and model not in CLEF_MODELS:
+                raise ValueError("Clef execution is restricted to Luna or Sol")
+            reasoning = original_reasoning
+            cached_updates = _cached_updates(scope, model, canonical_signature, _cache_ttl_seconds(payload))
+            if mode is not None:
+                effort = clef_effort(mode, effort)
+                reasoning = dict(original_reasoning or {})
+                reasoning["effort"] = clef_effort(mode, reasoning.get("effort") or effort)
+                cached_updates = tuple((index, clef_effort(mode, previous)) for index, previous in cached_updates)
             applied_updates, effort_transport = apply_route_payload(
-                payload, model, effort, original_reasoning, canonical_items,
-                _cached_updates(scope, model, canonical_signature,
-                                _cache_ttl_seconds(payload)),
+                payload, model, effort, reasoning, canonical_items, cached_updates,
             )
+            if provider == "clef" and isinstance(payload.get("input"), list):
+                # Inline caller updates must not override this attempt's model.
+                # Retain historical reasoning and other transport settings.
+                bounded_items = []
+                for item in payload["input"]:
+                    if isinstance(item, dict) and item.get("type") == "configuration_update":
+                        item = {key: value for key, value in item.items() if key != "model"}
+                        if isinstance(item.get("reasoning"), dict):
+                            item["reasoning"] = {**item["reasoning"],
+                                                 "effort": clef_effort(mode, item["reasoning"].get("effort"))}
+                        if set(item) == {"type"}:
+                            continue
+                    bounded_items.append(item)
+                payload["input"] = bounded_items
+                # The final inline reasoning update otherwise wins over the
+                # request-level effort. Make the chosen effort authoritative.
+                for item in reversed(bounded_items):
+                    if (isinstance(item, dict) and item.get("type") == "configuration_update"
+                            and isinstance(item.get("reasoning"), dict)):
+                        item["reasoning"] = {**item["reasoning"], "effort": effort}
+                        break
+            return model, effort
 
         if not no_fallback:
-            apply_route(model, effort)
+            model, effort = apply_route(model, effort)
             if debug:
                 try:
                     append_private(os.path.join(STATE, "jev-router-debug.jsonl"), json.dumps(
@@ -2415,7 +2590,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             status, out_kind, ctype, quota_hit, unwritten, resets_at = self._forward(
                 payload, out_path, stream_requested, debug, marker, model, signature, effort,
-                exact_route=bool(dry_reason and model not in TIERS))
+                exact_route=provider == "clef" or bool(dry_reason and model not in TIERS))
         retried = False
         fallback = None
         if quota_hit and not dry_reason:
@@ -2423,11 +2598,11 @@ class Handler(BaseHTTPRequestHandler):
             # retry this exact canonical call before anything reaches the client.
             mark_native_dry("quota", resets_at=resets_at)
             dry_reason = "quota"
-            fallback_plan = fallback_candidates(native_model, payload)
+            fallback_plan = permitted_fallbacks()
             if fallback_plan:
                 model = fallback_plan.pop(0)
                 effort = tandem_effort(effort, native_model)
-                apply_route(model, effort)
+                model, effort = apply_route(model, effort)
                 retried = True
                 gate = f"codex_dry(retry):{native_model}"
                 marker = route_marker(model, effort)
@@ -2447,7 +2622,7 @@ class Handler(BaseHTTPRequestHandler):
             # removed jev/auto and incompatible/offline local routes.
             fallback = fallback_plan.pop(0)
             model, effort = fallback, tandem_effort(effort, native_model)
-            apply_route(model, effort)
+            model, effort = apply_route(model, effort)
             gate = f"codex_dry(fallback):{native_model}"
             marker = route_marker(model, effort)
             signature = presentation_signature(payload, {"model": model, "effort": effort})
@@ -2459,16 +2634,19 @@ class Handler(BaseHTTPRequestHandler):
                 and self._attempts[-1].get("completion") == "empty_completion"):
             # Native-only technical recovery, once and before any bytes escape.
             # Do not re-enter native service after a quota/provider fallback.
-            recovery_model, recovery_effort = ASTRA, "medium"
+            recovery_model, recovery_effort = (SOL if provider == "clef" else ASTRA), "medium"
+            if mode is not None:
+                recovery_effort = clef_effort(mode, recovery_effort)
             if (model, effort) != (recovery_model, recovery_effort):
                 model, effort = recovery_model, recovery_effort
-                apply_route(model, effort)
+                model, effort = apply_route(model, effort)
                 marker = route_marker(model, effort)
                 signature = presentation_signature(payload, {"model": model, "effort": effort})
                 retried = True
                 gate = "empty_completion_retry"
                 status, out_kind, ctype, quota_hit, unwritten, _resets_at = self._forward(
-                    payload, out_path, stream_requested, debug, marker, model, signature, effort)
+                    payload, out_path, stream_requested, debug, marker, model, signature, effort,
+                    exact_route=provider == "clef")
         if unwritten is not None:
             # Every model that could have served this turn refused it, and the
             # refusal was held back only because another attempt might have
@@ -2507,8 +2685,9 @@ class Handler(BaseHTTPRequestHandler):
             decision and not retried and not fallback and not shadow_enabled
             and decision.get("model") == model and decision.get("effort") == effort
         ) else None
-        remember_route_lease(scope, payload, step, lease_decision, completed_status)
+        remember_route_lease(lease_scope, lease_payload, step, lease_decision, completed_status)
         route_failure_evidence(scope, payload, self._attempts)
+        self._record_feedback_attempts()
         log_line({
             "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "policy_version": POLICY_VERSION,
@@ -2521,6 +2700,9 @@ class Handler(BaseHTTPRequestHandler):
             "attempts": self._attempts,
             "decision_source": decision_source,
             "decision_provider": provider,
+            "auto_mode": mode,
+            "effort_policy": "adaptive-v1" if mode is not None else None,
+            "verification": verification,
             "lease": decision.get("lease") if decision else None,
             "lease_hit": decision_source == "lease",
             "gate": gate,
@@ -2579,6 +2761,7 @@ class Handler(BaseHTTPRequestHandler):
         reopens, when it announced one.
         """
         body = json.dumps(payload).encode("utf-8")
+        relay_started = time.monotonic()
         conn = http.client.HTTPConnection(*ROUTER, timeout=900)
         status = 0
         out_kind = ""
@@ -2787,6 +2970,7 @@ class Handler(BaseHTTPRequestHandler):
             return status, "json", "application/json", False, data, None
         finally:
             attempt["status"] = status
+            attempt["latency_ms"] = round((time.monotonic() - relay_started) * 1000)
             if markerer is not None:
                 attempt["output_exposed"] = markerer.exposed
                 attempt["preterminal_actionable"] = markerer.actionable

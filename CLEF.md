@@ -5,8 +5,21 @@ Apache-2.0 open-weight decision model, through llama.cpp's native System One
 endpoint. Clef selects the execution model and reasoning effort; Codex work still
 runs on your signed-in ChatGPT plan. There is no hosted Jev request in this profile.
 
-The model picker shows **Auto (Clef)**. Its internal ID remains `jev/auto` to retain
-the embedded router's native Responses history and tool-continuation handling.
+The model picker exposes three effort preferences, all selecting between **Luna
+and Sol**. Astra is blocked in every profile. Every profile allows **low, medium,
+high, xhigh and max** reasoning. Clef chooses sufficient effort for the current
+work; profiles guide that decision without imposing a floor or a range:
+
+| Profile | Picker ID | Effort preference | Picker default |
+|---|---|---|---|
+| Auto Cheap (Clef) | `jev/auto-cheap` | Prefer low; increase when difficulty or failures justify more care | low |
+| Auto Standard (Clef) | `jev/auto` | Balance care and cost at sufficient effort | medium |
+| Auto Deep (Clef) | `jev/auto-deep` | Prefer careful reasoning for difficult decisions; keep trivial work low | high |
+
+Standard retains `jev/auto` for existing conversations. The picker defaults are
+UI hints; Clef can select any supported effort in every mode. Deep can select
+Luna at low effort for a trivial task, and Cheap can select higher effort when
+the work warrants it. Preferences do not establish token budgets or usage savings.
 
 ## Build and download
 
@@ -42,7 +55,7 @@ From this repository, with a supported Node binary on PATH:
 python3 server/install-clef.py \
   --llama-server ~/repos/llama.cpp/build/bin/llama-server \
   --model ~/.local/share/clef/models/Clef-Flash-Q8_0.gguf \
-  --node "$(command -v node)" --share-chatgpt --smoke
+  --node "$(command -v node)" --sleep-idle-seconds 300 --share-chatgpt --smoke
 ```
 
 `--share-chatgpt` explicitly authorizes the local router to use Codex's native
@@ -50,7 +63,7 @@ session. `--smoke` sends one real request and consumes ChatGPT quota. Omit it fo
 installation without a live request. The installer validates the running Clef
 profile either way; readiness alone does not prove end-to-end routing.
 
-Fully quit and reopen Codex when convenient, then select **Auto (Clef)**. The
+Fully quit and reopen Codex when convenient, then select an Auto profile. The
 installer preserves your existing default model, agent preferences, and unrelated
 settings. It disables installation of the router's optional helper skill pack and
 automatic agent concurrency defaults. Those opt-outs are forwarded to the macOS
@@ -69,8 +82,36 @@ that directory, local state, capability URLs, or raw service logs.
 | Decision adapter | 4319 | `com.thibaultsaintjean.jev-router` |
 | Codex Router | 4202 | `io.github.codex-router` |
 
-The Clef service uses Q8_0, Metal offload, one slot, and an 8192-token context. Its
-owner-only generated key is `~/.codex/codex-router/clef-api.key`; only a file path
+The llama.cpp router listens on port 8082 and loads Clef on demand. Its editable
+presets are in `~/.local/share/clef/models.ini`; the installer preserves additional
+model sections when refreshed. `--models-max 1` limits the router to one loaded
+model at a time. Clef uses Q8_0, Metal offload, one slot, and an 8192-token context.
+
+The shared preset default `sleep-idle-seconds = 300` unloads model weights and KV
+memory after five minutes without inference. The router stays available; the next
+request reloads the requested model. Health/model/props checks do not wake it or
+reset the timer. Change the timeout using the installer's positive
+`--sleep-idle-seconds` option; use `--models-preset PATH` for another preset file.
+New model sections inherit the idle default unless they override it. For example:
+
+```ini
+[another-model]
+model = /absolute/path/to/another-model.gguf
+n-gpu-layers = 99
+ctx-size = 8192
+load-on-startup = false
+```
+
+Edit the preset and restart the service to publish another model:
+
+```sh
+launchctl kickstart -k "gui/$(id -u)/com.xangma.clef-flash"
+```
+Adding a model to llama.cpp makes it available for local clients; selecting it as
+Codex's classifier also requires changing `CLEF_MODEL`, and it must support the
+native `/v1/systemone` decision API.
+
+The owner-only generated key is `~/.codex/codex-router/clef-api.key`; only a file path
 appears in process arguments. Local inference disables environment proxies and
 redirects. Clef uses `/v1/systemone`, not a chat-completions endpoint.
 
@@ -85,21 +126,61 @@ JEV_DECISION_TIMEOUT=30
 JEV_BASELINE_MODEL=gpt-6.1-sol
 ```
 
-On Clef errors, routing uses Sol with medium reasoning. It never retries through
-hosted Jev. The active mandatory-Astra policy still applies to valid decisions.
-The kill switch and shadow mode use the configured baseline. Upstream behavior
-is unchanged when `JEV_DECISION_PROVIDER` is omitted.
+Clef execution is restricted to **Luna and Sol; Astra is disabled**. Its classifier
+asks only for Luna/Sol capability, reasoning effort and a route lease. Sol handles
+architecture and final or risk-focused review. A hard dispatch ceiling also caps
+historical Astra decisions and leases, configured baselines, shadow/kill-switch
+routes and empty-completion recovery at Sol. Replayed configuration updates cannot
+override the selected execution model or the selected adaptive effort. Clef
+requests also disable the parent router's cooldown rerouting and provider failover,
+so it cannot replace the chosen model or effort. A technical classifier/provider
+error uses Sol at medium effort in every mode and never retries through hosted
+Jev. Explicit test or check failures inform the next adaptive decision. Quota
+fallbacks accept only explicit Luna/Sol IDs; opaque provider aliases are excluded, so exhausted native usage may
+return an error instead of selecting another provider. Upstream behavior is
+unchanged when `JEV_DECISION_PROVIDER` is omitted.
+
+The local adaptive policy supplies bounded aggregate feedback from prior routes:
+token usage, latency, and explicit test or check outcomes when available. These
+observations are advisory evidence for future decisions. They do not provide
+calibrated success probabilities or establish that a particular effort will save
+quota. HTTP status and a `completed` response indicate transport and completion;
+correctness evidence comes from explicit checks. Missing check outcomes remain
+unknown. Feedback is aggregated locally rather than storing prompt or response
+text. The owner-only aggregate file is
+`~/.codex/codex-router/adaptive-feedback.json`; keep it private with the other
+router state.
+
+Check evidence comes from a recognized test, lint, typecheck or smoke command
+matched to its latest tool result. Literal `functions.exec` wrappers are supported;
+ambiguous or dynamic commands remain unknown. Route attribution requires a stable
+prompt cache key. Replayed results are counted once, failed checks clear the route
+lease, and passing checks permit effort to decrease. Scope history stays in memory;
+aggregate measurements survive restart. Checks observe outcomes of the work, not
+proof that the last selected model authored a correct solution.
 
 ```sh
 curl -fsS http://127.0.0.1:4319/health
-JEV_DECISION_PROVIDER=clef python3 server/smoke.py
+JEV_DECISION_PROVIDER=clef python3 server/smoke.py --model jev/auto
+JEV_DECISION_PROVIDER=clef python3 server/smoke.py --model jev/auto-cheap
+JEV_DECISION_PROVIDER=clef python3 server/smoke.py --model jev/auto-deep
 ```
 
 A successful smoke receipt reports `decision_source: clef`, matching `model` and
 `response_model`, `status: completed`, and `visible_model_effort: confirmed`.
+This verifies the routed request and visible model/effort signature. With the
+installed 300-second timeout on 2026-10-10, Clef reported sleeping at 301 seconds:
+combined router/child RSS fell from about 10.1 GiB to 263 MiB. A new native decision request reloaded the model
+and answered in 1.1 seconds. These are observations from this Mac, not latency
+or memory guarantees for another model or machine.
+
 The local validation also completed a real function-call/tool-result continuation
 with a model change from Sol to Luna between calls. Automated checks cover local
-credentials, redirects, routing failures, mandatory policy, and preserved settings.
+credentials, redirects, routing failures, the no-Astra ceiling, and preserved settings.
+On 2026-10-10, all 261 server tests passed. The adaptive profile was deployed and
+all three live Auto smoke requests selected Luna at low effort for `Reply only OK`,
+including Deep. HTTP checks also cover failed/pass outcomes, replay deduplication,
+lease reconsideration, rapid tool-result handoffs, and disconnected attempt costs.
 
 Clef logs are in `~/Library/Logs/clef-flash.{out,err}.log`; adapter logs use
 `jev-router.{out,err}.log`. To stop Clef temporarily:

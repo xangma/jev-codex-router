@@ -1,5 +1,7 @@
 """Install the local Clef profile using the embedded router's managed commands."""
 import argparse
+import configparser
+import io
 import json
 import os
 from pathlib import Path
@@ -15,6 +17,7 @@ import urllib.request
 
 REPO = Path(__file__).resolve().parent.parent
 LABEL = "com.xangma.clef-flash"
+PICKER_MODELS = ("jev/auto-cheap", "jev/auto", "jev/auto-deep")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -41,6 +44,78 @@ def ensure_key(path):
         raise RuntimeError("Clef key must be an owner-only regular file")
     if not path.read_text().strip():
         raise RuntimeError("Clef key file is empty")
+
+
+def positive_seconds(value):
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("idle timeout must be a positive integer") from None
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("idle timeout must be a positive integer")
+    return seconds
+
+
+def render_clef_preset(existing_text, model, sleep_idle_seconds=300):
+    """Refresh managed options while retaining other models and custom options."""
+    seconds = positive_seconds(sleep_idle_seconds)
+    if any(character in str(model) for character in "\r\n"):
+        raise ValueError("The model path cannot contain a newline")
+    preset = configparser.ConfigParser(interpolation=None)
+    preset.optionxform = str
+    lines = existing_text.splitlines(keepends=True)
+    section_start = next((index for index, line in enumerate(lines)
+                          if line.lstrip().startswith("[")), len(lines))
+    preamble = "".join(lines[:section_start])
+    metadata = configparser.ConfigParser(interpolation=None)
+    metadata.read_string("[metadata]\n" + preamble)
+    if metadata.has_option("metadata", "version"):
+        if metadata["metadata"]["version"].strip() != "1":
+            raise ValueError("Unsupported llama.cpp preset version")
+    else:
+        preamble = preamble.rstrip() + ("\n" if preamble.strip() else "") + "version = 1\n"
+    if section_start < len(lines):
+        preset.read_string("".join(lines[section_start:]))
+    for section in ("*", "clef-flash"):
+        if not preset.has_section(section):
+            preset.add_section(section)
+    preset["*"]["sleep-idle-seconds"] = str(seconds)
+    for alias in ("m", "a", "ngl", "np", "c", "b", "ub", "sleep-idle-seconds"):
+        preset.remove_option("clef-flash", alias)
+    preset["clef-flash"].update({
+        "model": str(model), "alias": "clef-flash", "n-gpu-layers": "99",
+        "parallel": "1", "ctx-size": "8192", "batch-size": "8192",
+        "ubatch-size": "8192", "load-on-startup": "false",
+    })
+    output = io.StringIO()
+    preset.write(output)
+    return preamble.rstrip() + "\n\n" + output.getvalue()
+
+
+def write_clef_preset(path, model, sleep_idle_seconds=300):
+    """Atomically install an owner-only preset; return whether it changed."""
+    existing = ""
+    if path.exists() or path.is_symlink():
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise RuntimeError("Clef preset must be an owner-only regular file")
+        existing = path.read_text()
+    rendered = render_clef_preset(existing, model, sleep_idle_seconds)
+    if existing == rendered:
+        return False
+    temporary = path.with_name(path.name + "." + secrets.token_hex(8) + ".tmp")
+    try:
+        private_file(temporary, rendered.encode())
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return True
+
+
+def clef_service_arguments(binary, preset_file, key_file):
+    return [str(binary), "--models-preset", str(preset_file), "--models-max", "1",
+            "--models-autoload", "--host", "127.0.0.1", "--port", "8082",
+            "--no-webui", "--api-key-file", str(key_file)]
 
 
 def wait_clef(key_file, timeout=120):
@@ -74,6 +149,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--llama-server", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--models-preset", type=Path,
+                        default=Path.home() / ".local/share/clef/models.ini",
+                        help="Owner-only llama.cpp router preset file")
+    parser.add_argument("--sleep-idle-seconds", type=positive_seconds, default=300,
+                        help="Inherited model idle timeout in seconds (default: 300)")
     parser.add_argument("--node", default=shutil.which("node"))
     parser.add_argument("--share-chatgpt", action="store_true",
                         help="Allow the local router to use Codex's signed-in ChatGPT session")
@@ -85,6 +165,7 @@ def main():
     if not args.share_chatgpt:
         parser.error("Native execution requires explicit --share-chatgpt consent")
     binary, model = args.llama_server.resolve(), args.model.resolve()
+    preset_file = args.models_preset.expanduser().absolute()
     if not os.access(binary, os.X_OK) or not model.is_file():
         parser.error("A built llama-server and a downloaded Clef GGUF are required")
     if not args.node:
@@ -117,6 +198,7 @@ def main():
         backup = state / "clef-install-backups" / str(time.time_ns()) / "config.toml"
         private_file(backup, config.read_bytes())
     ensure_key(key_file)
+    preset_changed = write_clef_preset(preset_file, model, args.sleep_idle_seconds)
     logs = Path.home() / "Library/Logs"
     logs.mkdir(parents=True, exist_ok=True)
     for name in ("clef-flash.out.log", "clef-flash.err.log"):
@@ -131,10 +213,7 @@ def main():
             listener.bind(("127.0.0.1", 8082))
     service = {
         "Label": LABEL,
-        "ProgramArguments": [str(binary), "--model", str(model), "--alias", "clef-flash",
-                             "--host", "127.0.0.1", "--port", "8082", "-ngl", "99", "-np", "1",
-                             "-c", "8192", "-b", "8192", "-ub", "8192", "--no-webui",
-                             "--api-key-file", str(key_file)],
+        "ProgramArguments": clef_service_arguments(binary, preset_file, key_file),
         "WorkingDirectory": str(binary.parent), "RunAtLoad": True, "KeepAlive": True,
         "StandardOutPath": str(logs / "clef-flash.out.log"),
         "StandardErrorPath": str(logs / "clef-flash.err.log"),
@@ -158,7 +237,7 @@ def main():
     def registered():
         return subprocess.run(["launchctl", "print", service_target], capture_output=True).returncode == 0
 
-    if existing != service and registered():
+    if (existing != service or preset_changed) and registered():
         run("launchctl", "bootout", service_target, capture=True)
         deadline = time.monotonic() + 15
         while registered():
@@ -187,19 +266,22 @@ def main():
     run(cli, "chatgpt-session", "enable")
     run(REPO / "router/install.sh", "--auto", "--providers", "configured", "--no-tray")
     run(cli, "refresh-catalog")
-    run(REPO / "router/bin/control", "picker", "set", "jev/auto", "show")
+    for picker_model in PICKER_MODELS:
+        run(REPO / "router/bin/control", "picker", "set", picker_model, "show")
     env["JEV_PYTHON"] = sys.executable
     run("/bin/zsh", REPO / "server/install-service.sh")
     verify_clef_adapter()
     if args.smoke:
         run(sys.executable, REPO / "server/smoke.py")
-    print(json.dumps({"installed": "clef", "model": "jev/auto", "display": "Auto (Clef)",
-                      "next": "Restart Codex when convenient, then select Auto (Clef)."}))
+    print(json.dumps({"installed": "clef", "model": "jev/auto", "models": list(PICKER_MODELS),
+                      "display": "Auto Standard (Clef)", "models_preset": str(preset_file),
+                      "sleep_idle_seconds": args.sleep_idle_seconds,
+                      "next": "Restart Codex when convenient, then select Auto Cheap, Standard, or Deep (Clef)."}))
 
 
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
+    except (OSError, ValueError, RuntimeError, configparser.Error, subprocess.CalledProcessError) as error:
         print(json.dumps({"installed": False, "error_type": type(error).__name__}), file=sys.stderr)
         raise SystemExit(1)
