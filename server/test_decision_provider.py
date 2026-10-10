@@ -126,9 +126,11 @@ class DecisionConfiguration(unittest.TestCase):
         opener.open.return_value = response
         with mock.patch.dict(os.environ, clef_env(), clear=True), \
              mock.patch.object(jev, "load_clef_key", return_value="local-fixture"), \
+             mock.patch.object(jev, "model_version", return_value=(1,)), \
              mock.patch.object(jev.urllib.request, "build_opener", return_value=opener) as build:
             jev.call_jev_routed("hosted-fixture", "state", timeout=15)
-        self.assertEqual(opener.open.call_args.kwargs["timeout"], 30)
+        self.assertGreater(opener.open.call_args.kwargs["timeout"], 29)
+        self.assertLessEqual(opener.open.call_args.kwargs["timeout"], 30)
         self.assertEqual(build.call_args.args[0].proxies, {})
         self.assertIsInstance(build.call_args.args[1], jev._NoDecisionRedirect)
 
@@ -174,6 +176,7 @@ class ClefRoutingWorkflow(unittest.TestCase):
 
     def setUp(self):
         tmp = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(mock.patch.object(jev, "CLEF_CACHE", jev.DecisionCache()))
         key = Path(tmp, "clef.key")
         key.write_text("local-fixture\n")
         key.chmod(0o600)
@@ -235,6 +238,24 @@ class ClefRoutingWorkflow(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(self.logged.wait(3))
         return self.records[-1]
+
+    def test_local_duplicate_decision_reuses_result_and_changed_state_is_fresh(self):
+        self.enterContext(mock.patch.object(jev, "model_version", return_value=(1,)))
+        DecisionEndpoint.answer["answers"].pop("astra_policy")
+        body = {"state": {"task": "Synthetic duplicate decision"}, "questions": jev.clef_questions()}
+        first_status, first_raw = self.request(path="/ask", body=body)
+        second_status, second_raw = self.request(path="/ask", body=body)
+        first, second = json.loads(first_raw), json.loads(second_raw)
+        self.assertEqual((first_status, second_status), (200, 200))
+        self.assertEqual(len(DecisionEndpoint.requests), 1)
+        self.assertEqual(first["answers"], second["answers"])
+        self.assertFalse(first["decision_cache"]["hit"])
+        self.assertTrue(second["decision_cache"]["hit"])
+        self.assertEqual(second["usage"]["input_tokens"], 0)
+        self.assertEqual(second["decision_cache"]["saved_input_tokens"], 100)
+        body["state"]["task"] = "Changed decision"
+        self.assertEqual(self.request(path="/ask", body=body)[0], 200)
+        self.assertEqual(len(DecisionEndpoint.requests), 2)
 
     def test_local_body_auth_and_choice_decode_use_only_luna_sol_questions(self):
         record = self.route()

@@ -110,9 +110,12 @@ from local_runtime import (
 from adaptive_feedback import feedback_for
 from diagnostic_output import preview_tool_outputs
 from tool_results import output_text, tool_result_failed
+from decision_cache import DecisionCache, model_version
 
 from routing_policy import (ASTRA, EFFORTS, LUNA, NATIVE_MODELS, POLICY_VERSION, QUESTIONS, SOL, TERRA,
                             TIERS, decision_from_answers, route)
+
+CLEF_CACHE = DecisionCache()
 
 HOME = os.path.expanduser("~")
 ENV_PATH = os.path.join(HOME, ".hermes", ".env")
@@ -285,7 +288,8 @@ def decision_health():
                 "decision_configured": bool(load_decision_key(config)),
                 "decision_timeout": config["timeout"], "baseline_model": config["baseline"],
                 "allowed_execution_models": list(CLEF_MODELS if config["provider"] == "clef" else TIERS),
-                **({"auto_modes": CLEF_MODES, "effort_policy": "adaptive-v1"}
+                **({"auto_modes": CLEF_MODES, "effort_policy": "adaptive-v1",
+                    "clef_decision_cache": CLEF_CACHE.statistics()}
                    if config["provider"] == "clef" else {})}
     except ValueError as exc:
         return {"decision_provider": "invalid", "decision_configured": False,
@@ -798,22 +802,27 @@ def call_jev_routed(key, state, questions=None, timeout=None):
     clef_key = load_clef_key()
     if not clef_key:
         raise ValueError("Clef API key is not configured in a protected file")
+    payload = {"model": config["model"], "state": state,
+               "questions": clef_questions() if questions is None else questions}
     req = urllib.request.Request(
         config["endpoint"],
-        data=json.dumps({"model": config["model"], "state": state,
-                         "questions": clef_questions() if questions is None else questions}).encode(),
+        data=json.dumps(payload).encode(),
         headers={"Authorization": f"Bearer {clef_key}", "Content-Type": "application/json"},
         method="POST",
     )
     # Local auth must not travel through an environment proxy or a redirect.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoDecisionRedirect())
-    try:
-        response = opener.open(req, timeout=config["timeout"])
-    except urllib.error.HTTPError as exc:
-        exc.close()
-        raise
-    with response as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    def infer(remaining):
+        try:
+            response = opener.open(req, timeout=remaining)
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            raise
+        with response as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    return CLEF_CACHE.call(config["endpoint"], clef_key, payload, infer,
+                           config["timeout"], model_version(config["model"]))
 
 
 def validate_ask(body):
@@ -2304,6 +2313,7 @@ class Handler(BaseHTTPRequestHandler):
             "model": answer.get("model"),
             "answers": answer.get("answers") or {},
             "usage": answer.get("usage") or {},
+            **({"decision_cache": answer["decision_cache"]} if "decision_cache" in answer else {}),
             "ms": int((time.time() - t0) * 1000),
         })
 
@@ -2417,6 +2427,7 @@ class Handler(BaseHTTPRequestHandler):
         decision_ms = None
         decision = None
         jev_usage = None
+        decision_cache = None
         decision_source = None
         scope = cache_scope(payload, task)
         lease_scope = f"{scope}:clef:{mode}" if mode is not None else scope
@@ -2465,6 +2476,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     result = (call_jev_routed(key, state, clef_questions(mode))
                               if mode is not None else call_jev_routed(key, state))
+                    decision_cache = result.get("decision_cache") if mode is not None else None
                     decision = provider_decision(result.get("answers"), provider, mode)
                     raw_usage = result.get("usage") or {}
                     if not isinstance(raw_usage, dict):
@@ -2707,6 +2719,7 @@ class Handler(BaseHTTPRequestHandler):
             "base_tier": decision["base_model"] if decision else None,
             "jev_usage": jev_usage if provider == "jev" else None,
             "decision_usage": jev_usage,
+            "decision_cache": decision_cache,
             "attempts": self._attempts,
             "decision_source": decision_source,
             "decision_provider": provider,

@@ -87,8 +87,8 @@ presets are in `~/.local/share/clef/models.ini`; the installer preserves additio
 model sections when refreshed. `--models-max 1` limits the router to one loaded
 model at a time. Clef uses Q8_0, Metal offload, one slot, and an 8192-token context.
 
-The shared preset default `sleep-idle-seconds = 300` unloads model weights and KV
-memory after five minutes without inference. The router stays available; the next
+The shared preset default `sleep-idle-seconds = 300` unloads model weights and
+inference memory after five minutes without inference. The router stays available; the next
 request reloads the requested model. Health/model/props checks do not wake it or
 reset the timer. Change the timeout using the installer's positive
 `--sleep-idle-seconds` option; use `--models-preset PATH` for another preset file.
@@ -179,6 +179,23 @@ session and thread identity. Cache controls stay intact. This avoids losing loca
 session affinity; actual provider cache reads are measured from response usage,
 and cache hits are not guaranteed.
 
+In the tested llama.cpp build, Clef has no KV prefix cache: each fresh decision
+processes its whole prompt. The adapter reuses successful, identical local
+decisions for **60 seconds**, with at most **128 entries** in memory. Concurrent
+duplicates share one inference. Changes to state, feedback, questions, their
+order, mode, endpoint, credentials, or the managed preset/GGUF revision require
+fresh inference. Unknown model files and unsuccessful decisions bypass reuse.
+Prompt text and credentials are hashed for lookup and are not stored in cache
+entries or persisted. Restarting the adapter clears the cache; when replacing
+weights under the same alias, restart both the model service and adapter.
+
+`/health` exposes `clef_decision_cache` counters. Ask responses and route logs
+report `decision_cache.kind: exact_result` and `hit`; a hit reports zero newly
+processed `usage` tokens and the avoided count as `saved_input_tokens`.
+The native System One `input_tokens` count alone does not measure prefix-cache
+reuse. Changing decisions still run full Clef inference, and cache hits do not
+reset llama.cpp's idle timer.
+
 ```sh
 curl -fsS http://127.0.0.1:4319/health
 JEV_DECISION_PROVIDER=clef python3 server/smoke.py --model jev/auto
@@ -197,7 +214,7 @@ or memory guarantees for another model or machine.
 The local validation also completed a real function-call/tool-result continuation
 with a model change from Sol to Luna between calls. Automated checks cover local
 credentials, redirects, routing failures, the no-Astra ceiling, and preserved settings.
-On 2026-10-10, all 261 server tests passed. The adaptive profile was deployed and
+On 2026-10-10, all 296 server tests passed. The adaptive profile was deployed and
 all three live Auto smoke requests selected Luna at low effort for `Reply only OK`,
 including Deep. HTTP checks also cover failed/pass outcomes, replay deduplication,
 lease reconsideration, rapid tool-result handoffs, and disconnected attempt costs.
