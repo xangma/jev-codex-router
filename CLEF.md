@@ -159,6 +159,26 @@ lease, and passing checks permit effort to decrease. Scope history stays in memo
 aggregate measurements survive restart. Checks observe outcomes of the work, not
 proof that the last selected model authored a correct solution.
 
+Tool-step failures use explicit process exit status or MCP error status. Successful
+log and source reads stay clean even when their contents mention errors. Running
+commands remain pending; unknown plain results use anchored diagnostics rather
+than matching isolated words anywhere in the output.
+
+Textual tool results larger than 16 KiB receive a stable head-and-tail preview.
+The complete UTF-8 output is saved in owner-only, content-addressed files under
+`~/.codex/codex-router/tool-output/`; the preview gives its exact path for a
+targeted read. Original results are checked before previewing. User messages,
+instructions, calls, reasoning and structured or image results remain complete.
+If archival fails, the original result is forwarded. Files remain available until
+you remove them; keep this directory private and retain files needed by active
+chats. Previews stay identical across replay, model changes and service restarts.
+
+The classifier relay preserves validated native session UUIDs. When generic
+provider transport omits them, Codex's UUID `prompt_cache_key` restores stable
+session and thread identity. Cache controls stay intact. This avoids losing local
+session affinity; actual provider cache reads are measured from response usage,
+and cache hits are not guaranteed.
+
 ```sh
 curl -fsS http://127.0.0.1:4319/health
 JEV_DECISION_PROVIDER=clef python3 server/smoke.py --model jev/auto

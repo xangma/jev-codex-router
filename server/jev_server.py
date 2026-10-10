@@ -108,6 +108,8 @@ from local_runtime import (
     STATE, LocalServer, append_private, authorized, local_secret, protect_logs,
 )
 from adaptive_feedback import feedback_for
+from diagnostic_output import preview_tool_outputs
+from tool_results import output_text, tool_result_failed
 
 from routing_policy import (ASTRA, EFFORTS, LUNA, NATIVE_MODELS, POLICY_VERSION, QUESTIONS, SOL, TERRA,
                             TIERS, decision_from_answers, route)
@@ -356,8 +358,6 @@ QUOTA_RX = re.compile(
 # with. A relayed fallback stream is rewritten onto that opening id.
 TERMINAL_EVENT_TYPES = ("response.completed", "response.incomplete", "response.failed")
 
-ERROR_RX = re.compile(
-    r"(?i)(traceback|error|failed|exit code [1-9]|assertion|exception|fatal|panic)")
 DIGEST_CHARS = 280
 INTENT_CHARS = 160
 
@@ -972,28 +972,34 @@ def extract(payload):
 
 
 def _output_text(output):
-    """Best-effort text of a tool output item (str, list of parts, or dict)."""
-    if isinstance(output, str):
-        return output
-    if isinstance(output, list):
-        parts = []
-        for item in output:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                for key in ("text", "output", "content"):
-                    value = item.get(key)
-                    if isinstance(value, str):
-                        parts.append(value)
-                        break
-        return "\n".join(parts)
-    if isinstance(output, dict):
-        for key in ("text", "output", "content"):
-            value = output.get(key)
-            if isinstance(value, str):
-                return value
-        return json.dumps(output)[:4000]
-    return ""
+    """Bounded text for the decision dossier, never arbitrary object dumps."""
+    return output_text(output, limit=4000)
+
+
+def native_replay_headers(payload, incoming):
+    """Carry validated session identity across the local classifier hop.
+
+    Credentials are supplied separately by the parent. Codex uses its chat UUID
+    as prompt_cache_key, which also recovers identity when a generic-provider
+    transport omitted the original native session headers.
+    """
+    identity = ("session_id", "session-id", "thread-id", "x-client-request-id",
+                "x-codex-installation-id", "x-codex-parent-thread-id", "x-codex-window-id")
+    uuid_pattern = r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
+    result = {}
+    for name in identity:
+        value = incoming.get(name)
+        if isinstance(value, str) and re.fullmatch(uuid_pattern, value):
+            result[name] = value
+    originator = incoming.get("originator")
+    if isinstance(originator, str) and re.fullmatch(r"[A-Za-z0-9_. /-]{1,160}", originator):
+        result["originator"] = originator
+    key = payload.get("prompt_cache_key")
+    if isinstance(key, str) and re.fullmatch(uuid_pattern, key):
+        if not any(name in result for name in ("session_id", "session-id")):
+            result["session_id"] = key
+        result.setdefault("thread-id", key)
+    return result
 
 
 def classify(payload):
@@ -1013,7 +1019,7 @@ def classify(payload):
             text = _output_text(last.get("output"))
             detail["step_type"] = "tool_step"
             detail["digest"] = text.strip()[-DIGEST_CHARS:] if text else ""
-            detail["errored"] = bool(ERROR_RX.search(text[-4000:]))
+            detail["errored"] = tool_result_failed(last.get("output"))
             call_id = last.get("call_id")
             if call_id:
                 for item in reversed(inp[:-1]):
@@ -1039,9 +1045,8 @@ def classify(payload):
                 rows, errors = [], []
                 for item in batch:
                     text = _output_text(item.get("output")).strip()
-                    error = ERROR_RX.search(text[-4000:])
-                    excerpt = (text[-4000:][max(0, error.start() - 30):][:120]
-                               if error else text[-120:])
+                    error = tool_result_failed(item.get("output"))
+                    excerpt = text[-120:]
                     row = {"tool": calls.get(item.get("call_id"), ""),
                            "error": bool(error), "result": excerpt}
                     rows.append(row)
@@ -2394,9 +2399,6 @@ class Handler(BaseHTTPRequestHandler):
         # Our own answer signatures never travel back upstream (see
         # strip_signatures): the model must not read its own route tag.
         stripped = strip_signatures(payload)
-        canonical_items = (list(payload["input"])
-                           if isinstance(payload.get("input"), list) else None)
-        canonical_signature = _cache_signature(payload)
 
         t0 = time.time()
         debug = os.path.exists(DEBUG_PATH)
@@ -2421,6 +2423,14 @@ class Handler(BaseHTTPRequestHandler):
         lease_payload = {**payload, "_router_lease_mode": mode} if mode is not None else payload
         feedback, feedback_scope = self._feedback, self._feedback_scope
         verification = feedback.observe(feedback_scope, payload) if feedback is not None else None
+        # Judge/check evidence uses the original result, including its exit status.
+        # Normalize execution history before hashing it so previews remain stable
+        # on full replay, including after service restart or a model switch.
+        output_preview = (preview_tool_outputs(payload, STATE) if mode is not None
+                          else {"count": 0, "original_bytes": 0, "preview_bytes": 0})
+        canonical_items = (list(payload["input"])
+                           if isinstance(payload.get("input"), list) else None)
+        canonical_signature = _cache_signature(payload)
         if verification is not None:
             # A new check outcome changes the decision even on a clean tool chain.
             with _route_lease_lock:
@@ -2703,6 +2713,7 @@ class Handler(BaseHTTPRequestHandler):
             "auto_mode": mode,
             "effort_policy": "adaptive-v1" if mode is not None else None,
             "verification": verification,
+            "tool_output_preview": output_preview,
             "lease": decision.get("lease") if decision else None,
             "lease_hit": decision_source == "lease",
             "gate": gate,
@@ -2774,6 +2785,7 @@ class Handler(BaseHTTPRequestHandler):
         markerer = None
         try:
             headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+            headers.update(native_replay_headers(payload, self.headers))
             # The selected model must receive this exact canonical replay even
             # when the parent router's global aging/windowing knobs are enabled.
             # The local caller capability authenticates this internal contract;

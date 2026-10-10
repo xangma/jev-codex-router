@@ -302,6 +302,57 @@ class ClefRoutingWorkflow(unittest.TestCase):
         self.assertNotEqual(jev._lease_contract_fingerprint({"_router_lease_mode": "auto-cheap"}),
                             jev._lease_contract_fingerprint({"_router_lease_mode": "auto-deep"}))
 
+    def test_successful_diagnostic_words_keep_lease_but_nonzero_status_reconsiders(self):
+        opening = [routing.message("user", "Inspect these logs.")]
+        DecisionEndpoint.answer = routing.answer(jev.LUNA, "low", lease="user_turn")
+        self.route(routing.payload_for(opening, reasoning={"effort": "low"}))
+
+        def continuation(code):
+            return opening + [routing.tool_call("read"), routing.tool_step("read",
+                f"Process exited with code {code}\nFinal output:\n"
+                "ERROR: documentation example\nFAILED example\nexception handling")]
+
+        clean = self.route(routing.payload_for(continuation(0), reasoning={"effort": "low"}))
+        self.assertFalse(clean["errored"])
+        self.assertEqual(clean["decision_source"], "lease")
+        failed = self.route(routing.payload_for(continuation(1), reasoning={"effort": "low"}))
+        self.assertTrue(failed["errored"])
+        self.assertEqual(failed["decision_source"], "clef")
+        self.assertEqual(len(DecisionEndpoint.requests), 2)
+
+    def test_replay_restores_native_chat_identity_without_forwarding_local_auth(self):
+        chat = "12345678-1234-1234-1234-123456789abc"
+        opening = [routing.message("user", "Inspect the supplied fact.")]
+        self.route(routing.payload_for(opening, cache_key=chat))
+        headers = {key.lower(): value for key, value in routing.Edge.headers_seen[-1].items()}
+        self.assertEqual(headers["session_id"], chat)
+        self.assertEqual(headers["thread-id"], chat)
+        self.assertNotIn("authorization", headers)
+        self.assertNotIn("chatgpt-account-id", headers)
+        self.assertEqual(routing.Edge.payloads[-1]["prompt_cache_key"], chat)
+
+    def test_large_diagnostics_replay_stably_with_cache_affinity_and_retrievable_output(self):
+        from diagnostic_output import MAX_OUTPUT_BYTES
+        raw = "Process exited with code 0\nFinal output:\n" + "diagnostic row\n" * 5000
+        opening = [routing.message("user", "Inspect these supplied diagnostics.")]
+        history = opening + [routing.tool_call("read-1"), routing.tool_step("read-1", raw)]
+        self.route(routing.payload_for(history, reasoning={"effort": "low"}))
+        forwarded = routing.Edge.payloads[-1]
+        preview = forwarded["input"][-1]["output"]
+        self.assertLessEqual(len(preview.encode()), MAX_OUTPUT_BYTES)
+        archives = list(Path(jev.STATE, "tool-output").glob("*.txt"))
+        self.assertEqual(len(archives), 1)
+        self.assertEqual(archives[0].read_text(), raw)
+        self.assertEqual(history[-1]["output"], raw)
+        extended = history + [routing.tool_call("read-2"), routing.tool_step("read-2", "ok")]
+        record = self.route(routing.payload_for(extended, reasoning={"effort": "low"}))
+        self.assertEqual(routing.Edge.payloads[-1]["input"][:len(history)], forwarded["input"])
+        self.assertEqual(record["cache_state"]["models"]["luna"]["prefix"], "matched")
+        self.assertEqual(record["cache_state"]["models"]["luna"]["state"], "hot")
+        self.assertEqual(record["tool_output_preview"]["count"], 1)
+        self.assertGreater(record["tool_output_preview"]["original_bytes"], MAX_OUTPUT_BYTES)
+        self.assertNotIn(raw, json.dumps(record))
+
     def test_verified_checks_reconsider_leases_and_feed_actual_outcomes_to_clef(self):
         DecisionEndpoint.answer = routing.answer(jev.LUNA, "low", lease="user_turn")
         items = [routing.message("user", "Fix the failing unit test and verify it.")]
