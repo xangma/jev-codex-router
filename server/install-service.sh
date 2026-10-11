@@ -35,7 +35,7 @@ xml_escape() {
 CODEX_HOME_XML="$(xml_escape "$CODEX_HOME_VALUE")"
 STATE_XML="$(xml_escape "$STATE_VALUE")"
 DECISION_ENV_XML="$(
-  for name in JEV_DECISION_PROVIDER CLEF_ENDPOINT CLEF_MODEL CLEF_API_KEY_FILE JEV_DECISION_TIMEOUT JEV_BASELINE_MODEL; do
+  for name in JEV_DECISION_PROVIDER CLEF_ENDPOINT CLEF_MODEL CLEF_API_KEY_FILE CLEF_EFFORT_BOUNDS_FILE JEV_DECISION_TIMEOUT JEV_BASELINE_MODEL; do
     value=$(printenv "$name" 2>/dev/null || saved_value "$name")
     if [ -n "$value" ]; then
       printf '    <key>%s</key><string>%s</string>\n' "$name" "$(xml_escape "$value")"

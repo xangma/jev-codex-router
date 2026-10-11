@@ -40,6 +40,11 @@ def effective_effort(payload):
 
 
 class DecisionConfiguration(unittest.TestCase):
+    def setUp(self):
+        tmp = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(mock.patch.object(jev, "STATE", tmp))
+        self.enterContext(mock.patch.dict(os.environ, {"CLEF_EFFORT_BOUNDS_FILE": os.path.join(tmp, "bounds.json")}))
+
     def test_default_profile_preserves_jev_and_astra(self):
         with mock.patch.dict(os.environ, {}, clear=True), \
              mock.patch.object(jev, "call_jev", return_value={"answers": {}}) as hosted:
@@ -100,7 +105,7 @@ class DecisionConfiguration(unittest.TestCase):
         for mode, profile in jev.CLEF_MODES.items():
             for cap in jev.EFFORTS:
                 question = jev.clef_questions(mode, cap)["route"]
-                expected = {f"luna_{effort}" for effort in jev.EFFORTS} | {
+                expected = {f"luna_{effort}" for effort in jev.EFFORTS[1:]} | {
                     f"sol_{effort}" for effort in jev.EFFORTS[:jev.EFFORTS.index(cap) + 1]}
                 self.assertEqual(set(question["criteria"]), expected)
                 self.assertIn(profile["preference"], question["instructions"])
@@ -108,7 +113,8 @@ class DecisionConfiguration(unittest.TestCase):
                     for effort in jev.EFFORTS:
                         with self.subTest(mode=mode, cap=cap, model=model, effort=effort):
                             answers = clef_answer(model, effort)["answers"]
-                            if model == jev.SOL and jev.EFFORTS.index(effort) > jev.EFFORTS.index(cap):
+                            if ((model == jev.SOL and jev.EFFORTS.index(effort) > jev.EFFORTS.index(cap))
+                                    or (model == jev.LUNA and effort == "low")):
                                 with self.assertRaises(ValueError):
                                     jev.provider_decision(answers, "clef", mode, cap)
                             else:
@@ -119,12 +125,13 @@ class DecisionConfiguration(unittest.TestCase):
         self.assertNotEqual(jev.clef_questions("auto-cheap"), jev.clef_questions("auto-deep"))
 
     def test_joint_distribution_is_validated_without_marginal_argmax_assumptions(self):
+        bounds = {"luna": {"min": "low", "max": "max"}, "sol": {"min": "low", "max": "max"}}
         answers = clef_answer(jev.LUNA, "low")["answers"]
-        choices = jev.clef_questions(sol_cap="medium")["route"]["criteria"]
+        choices = jev.clef_questions(sol_cap="medium", bounds=bounds)["route"]["criteria"]
         probabilities = {choice: 0 for choice in choices}
         probabilities.update(luna_low=0.4, sol_low=0.3, sol_medium=0.3)
         answers["route"]["probabilities"] = probabilities
-        decision = jev.provider_decision(answers, "clef", sol_cap="medium")
+        decision = jev.provider_decision(answers, "clef", sol_cap="medium", bounds=bounds)
         self.assertEqual((decision["model"], decision["effort"]), (jev.LUNA, "low"))
         self.assertEqual(decision["chosen_probability"], 0.4)
         self.assertEqual(decision["probabilities"]["model"]["sol"], 0.6)
@@ -132,7 +139,7 @@ class DecisionConfiguration(unittest.TestCase):
                         {**probabilities, "luna_low": 0.2, "sol_low": 0.5}):
             answers["route"]["probabilities"] = invalid
             with self.assertRaises(ValueError):
-                jev.provider_decision(answers, "clef", sol_cap="medium")
+                jev.provider_decision(answers, "clef", sol_cap="medium", bounds=bounds)
 
     def test_picker_defaults_and_historical_routes_cap_only_sol(self):
         for mode, default in jev.CLEF_DEFAULT_CAPS.items():
@@ -186,6 +193,7 @@ class DecisionEndpoint(BaseHTTPRequestHandler):
     answer = None
     status = 200
     redirect = None
+    before_answer = None
 
     def log_message(self, *args):
         pass
@@ -193,6 +201,8 @@ class DecisionEndpoint(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         type(self).requests.append((self.path, dict(self.headers), body))
+        if type(self).before_answer is not None:
+            type(self).before_answer()
         data = json.dumps(type(self).answer).encode()
         self.send_response(type(self).status)
         self.send_header("Content-Type", "application/json")
@@ -252,9 +262,10 @@ class ClefRoutingWorkflow(unittest.TestCase):
             jev._route_leases.clear()
             jev._route_failures.clear()
         DecisionEndpoint.requests = []
-        DecisionEndpoint.answer = clef_answer(jev.LUNA, "low")
+        DecisionEndpoint.answer = clef_answer(jev.LUNA, "medium")
         DecisionEndpoint.status = 200
         DecisionEndpoint.redirect = None
+        DecisionEndpoint.before_answer = None
         routing.Edge.payloads = []
         routing.Edge.headers_seen = []
 
@@ -284,6 +295,11 @@ class ClefRoutingWorkflow(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(self.logged.wait(3))
         return self.records[-1]
+
+    def write_bounds(self, luna_min="medium", luna_max="max", sol_min="low", sol_max="max"):
+        bounds = {"luna": {"min": luna_min, "max": luna_max}, "sol": {"min": sol_min, "max": sol_max}}
+        Path(jev.STATE, "clef-effort-bounds.json").write_text(json.dumps(bounds))
+        return bounds
 
     def test_local_duplicate_decision_reuses_result_and_changed_state_is_fresh(self):
         self.enterContext(mock.patch.object(jev, "model_version", return_value=(1,)))
@@ -319,9 +335,9 @@ class ClefRoutingWorkflow(unittest.TestCase):
         self.assertEqual(body["questions"], jev.clef_questions("auto"))
         self.assertEqual(set(body["questions"]), {"route", "lease"})
         self.assertEqual(set(body["questions"]["route"]["criteria"]), {
-            "luna_low", "luna_medium", "luna_high", "luna_xhigh", "luna_max", "sol_low", "sol_medium"})
+            "luna_medium", "luna_high", "luna_xhigh", "luna_max", "sol_low", "sol_medium"})
         self.assertIn("task", body["state"])
-        self.assertEqual((record["model"], record["effort"]), (jev.LUNA, "low"))
+        self.assertEqual((record["model"], record["effort"]), (jev.LUNA, "medium"))
         self.assertEqual(record["decision_source"], "clef")
         self.assertEqual(record["decision_provider"], "clef")
         self.assertIsNotNone(record["decision_ms"])
@@ -334,7 +350,176 @@ class ClefRoutingWorkflow(unittest.TestCase):
             answer["confidence"] = 0.01
         self.assertEqual(self.route()["model"], jev.LUNA)
 
+    def test_default_bounds_exclude_luna_low_and_keep_medium_through_max(self):
+        DecisionEndpoint.answer = clef_answer(jev.LUNA, "medium")
+        record = self.route()
+        self.assertEqual((record["model"], record["effort"]), (jev.LUNA, "medium"))
+        criteria = DecisionEndpoint.requests[-1][2]["questions"]["route"]["criteria"]
+        self.assertNotIn("luna_low", criteria)
+        self.assertEqual({key for key in criteria if key.startswith("luna_")},
+                         {"luna_medium", "luna_high", "luna_xhigh", "luna_max"})
+
+    def test_custom_bounds_offer_only_allowed_pairs_and_bound_historical_updates(self):
+        bounds = self.write_bounds(luna_min="high", luna_max="xhigh", sol_min="medium", sol_max="high")
+        for model, raw, expected in ((jev.LUNA, "low", "high"), (jev.LUNA, "max", "xhigh"),
+                                     (jev.SOL, "low", "medium"), (jev.SOL, "max", "high")):
+            with self.subTest(model=model, raw=raw):
+                DecisionEndpoint.answer = routing.answer(model, raw)
+                body = routing.payload_for([
+                    {"type": "configuration_update", "model": jev.ASTRA, "reasoning": {"effort": "low"}},
+                    routing.message("user", "Preserve this supplied task."),
+                    {"type": "reasoning", "encrypted_content": "synthetic-thinking"},
+                    routing.tool_call("bounds-call"), routing.tool_step("bounds-call", "exact result"),
+                    {"type": "configuration_update", "reasoning": {"effort": "max"}}],
+                    reasoning={"effort": "max", "summary": "auto"})
+                record = self.route(body)
+                sent = routing.Edge.payloads[-1]
+                self.assertEqual((record["model"], record["effort"]), (model, expected))
+                self.assertEqual(effective_effort(sent), expected)
+                self.assertEqual(record["effort_bounds"], bounds)
+                self.assertEqual(sent["input"][1:5], body["input"][1:5])
+                allowed = jev.allowed_efforts(model, bounds, "max")
+                self.assertIn(sent["reasoning"]["effort"], allowed)
+                for item in sent["input"]:
+                    if item.get("type") == "configuration_update":
+                        self.assertNotIn("model", item)
+                        self.assertIn(item["reasoning"]["effort"], allowed)
+                request = DecisionEndpoint.requests[-1][2]
+                self.assertEqual(set(request["questions"]["route"]["criteria"]),
+                                 {"luna_high", "luna_xhigh", "sol_medium", "sol_high"})
+                self.assertEqual(request["state"]["effort_policy"]["effort_bounds"], bounds)
+
+    def test_bounds_change_invalidates_lease_and_replayed_effort_without_losing_history(self):
+        opening = [routing.message("user", "Complete this bounded task.")]
+        DecisionEndpoint.answer = clef_answer(jev.LUNA, "max", lease="user_turn")
+        first = self.route(routing.payload_for(opening, reasoning={"effort": "medium"}))
+        self.assertEqual(first["effort_transport"], "configuration_update")
+        continuation = opening + [routing.tool_call("bounds-replay"), routing.tool_step("bounds-replay", "OK")]
+        leased = self.route(routing.payload_for(continuation, reasoning={"effort": "medium"}))
+        self.assertEqual(leased["decision_source"], "lease")
+        self.assertEqual(leased["effort_transport"], "configuration_update_replay")
+        self.assertEqual(effective_effort(routing.Edge.payloads[-1]), "max")
+        bounds = self.write_bounds(luna_max="high", sol_min="medium", sol_max="high")
+        DecisionEndpoint.answer = clef_answer(jev.LUNA, "high", lease="user_turn")
+        changed = self.route(routing.payload_for(continuation, reasoning={"effort": "medium"}))
+        sent = routing.Edge.payloads[-1]
+        self.assertEqual(changed["decision_source"], "clef")
+        self.assertEqual(len(DecisionEndpoint.requests), 2)
+        self.assertEqual(changed["cache_scope"], first["cache_scope"])
+        self.assertEqual(changed["effort_bounds"], bounds)
+        self.assertEqual(effective_effort(sent), "high")
+        self.assertEqual([item for item in sent["input"] if item.get("type") != "configuration_update"], continuation)
+        for item in sent["input"]:
+            if item.get("type") == "configuration_update":
+                self.assertIn(item["reasoning"]["effort"], ["medium", "high"])
+        self.assertNotEqual(jev._lease_contract_fingerprint({"_router_effort_bounds": first["effort_bounds"]}),
+                            jev._lease_contract_fingerprint({"_router_effort_bounds": bounds}))
+        stale = jev.decision_from_answers(routing.answer(jev.LUNA, "max")["answers"])
+        with mock.patch.object(jev, "route_lease", return_value=stale):
+            record = self.route(routing.payload_for(continuation, reasoning={"effort": "medium"}))
+        self.assertEqual((record["model"], effective_effort(routing.Edge.payloads[-1])), (jev.LUNA, "high"))
+
+    def test_bounds_are_one_snapshot_even_if_file_changes_during_classifier_call(self):
+        initial = self.write_bounds(luna_min="low", luna_max="high")
+        changed = {"luna": {"min": "max", "max": "max"}, "sol": {"min": "max", "max": "max"}}
+        DecisionEndpoint.before_answer = lambda: Path(jev.STATE, "clef-effort-bounds.json").write_text(json.dumps(changed))
+        DecisionEndpoint.answer = clef_answer(jev.LUNA, "high", lease="user_turn")
+        opening = [routing.message("user", "Continue this supplied task.")]
+        with mock.patch.object(jev, "load_bounds", wraps=jev.load_bounds) as load:
+            first = self.route(routing.payload_for(opening))
+        self.assertEqual(load.call_count, 1)
+        self.assertEqual((first["effort"], effective_effort(routing.Edge.payloads[-1])), ("high", "high"))
+        self.assertEqual(first["effort_bounds"], initial)
+        self.assertEqual(DecisionEndpoint.requests[-1][2]["state"]["effort_policy"]["effort_bounds"], initial)
+        DecisionEndpoint.before_answer = None
+        DecisionEndpoint.answer = clef_answer(jev.LUNA, "max")
+        continuation = opening + [routing.tool_call("snapshot"), routing.tool_step("snapshot", "OK")]
+        second = self.route(routing.payload_for(continuation))
+        self.assertEqual((second["decision_source"], second["effort"]), ("clef", "max"))
+        self.assertEqual(second["effort_bounds"], changed)
+        self.assertEqual(len(DecisionEndpoint.requests), 2)
+        self.assertEqual(set(DecisionEndpoint.requests[-1][2]["questions"]["route"]["criteria"]), {"luna_max"})
+
+    def test_invalid_bounds_fail_closed_before_classifier_or_executor(self):
+        for raw in ("not JSON", json.dumps({"luna": {"min": "max", "max": "low"}}),
+                    json.dumps({"sol": {"max": "unsupported"}})):
+            with self.subTest(raw=raw):
+                Path(jev.STATE, "clef-effort-bounds.json").write_text(raw)
+                status, _ = self.request()
+                self.assertEqual(status, 503)
+                self.assertEqual(self.request("/ask", {"state": "synthetic", "questions": jev.QUESTIONS})[0], 503)
+                _, response = self.request("/health")
+                self.assertFalse(json.loads(response)["ok"])
+        self.assertEqual(DecisionEndpoint.requests, [])
+        self.assertEqual(routing.Edge.payloads, [])
+
+    def test_no_sol_pairs_map_stale_lease_and_operational_baselines_to_luna(self):
+        bounds = self.write_bounds(luna_min="high", sol_min="high")
+        body = routing.payload_for([routing.message("user", "Continue this supplied task."),
+                                   {"type": "configuration_update", "model": jev.SOL,
+                                    "reasoning": {"effort": "max"}}], reasoning={"effort": "low"})
+        for old_model in (jev.SOL, jev.ASTRA):
+            stale = jev.decision_from_answers(routing.answer(old_model, "low")["answers"])
+            with mock.patch.object(jev, "route_lease", return_value=stale):
+                record = self.route(body)
+            self.assertEqual((record["model"], effective_effort(routing.Edge.payloads[-1])), (jev.LUNA, "high"))
+            self.assertEqual(record["sol_effort_cap"], "low")
+        for failure in ("technical", "missing_key", "off", "shadow"):
+            with self.subTest(failure=failure):
+                DecisionEndpoint.answer = clef_answer(jev.LUNA, "high")
+                DecisionEndpoint.status = 503 if failure == "technical" else 200
+                with mock.patch.dict(os.environ, {"CLEF_API_KEY_FILE": "/missing.key"} if failure == "missing_key" else {}):
+                    sentinel = {"off": jev.OFF_PATH, "shadow": jev.SHADOW_PATH}.get(failure)
+                    if sentinel:
+                        Path(sentinel).touch()
+                    try:
+                        record = self.route(body)
+                    finally:
+                        if sentinel:
+                            Path(sentinel).unlink()
+                self.assertEqual((record["model"], record["effort"]), (jev.LUNA, "high"))
+                self.assertEqual(effective_effort(routing.Edge.payloads[-1]), "high")
+                self.assertEqual(record["effort_bounds"], bounds)
+                self.assertEqual(record["sol_effort_cap"], "low")
+                if failure == "shadow":
+                    self.assertEqual(record["gate"], "shadow(luna)")
+        self.assertTrue(DecisionEndpoint.requests)
+        for _, _, request in DecisionEndpoint.requests:
+            self.assertEqual(set(request["questions"]["route"]["criteria"]), {"luna_high", "luna_xhigh", "luna_max"})
+
+    def test_no_sol_empty_recovery_and_quota_paths_do_not_raise_picker_ceiling(self):
+        self.write_bounds(luna_min="high", sol_min="high")
+        for failure in ("empty_completion", "quota", "manual_dry"):
+            with self.subTest(failure=failure):
+                served = []
+
+                def forward(handler, payload, path, stream, debug, marker, model, signature, effort, exact_route=False):
+                    served.append((model, effort, effective_effort(payload)))
+                    first = len(served) == 1 and failure != "manual_dry"
+                    status = (429 if failure == "quota" else 502) if first else 200
+                    handler._attempts.append({"model": model, "effort": effort, "status": status,
+                        "completion": failure if first else "response.completed",
+                        "terminal_type": None if first else "response.completed"})
+                    return status, "json", "application/json", first and failure == "quota", b"{}", None
+
+                DecisionEndpoint.answer = clef_answer(jev.LUNA, "max")
+                body = routing.payload_for([routing.message("user", "Continue."),
+                    {"type": "configuration_update", "model": jev.ASTRA, "reasoning": {"effort": "max"}}],
+                    reasoning={"effort": "low"})
+                with mock.patch.object(jev.Handler, "_forward", new=forward), \
+                     mock.patch.object(jev, "fallback_candidates", return_value=[jev.SOL, jev.LUNA]), \
+                     mock.patch.object(jev, "native_dry", return_value="manual" if failure == "manual_dry" else None):
+                    self.logged.clear()
+                    status, _ = self.request(body=body)
+                    self.assertTrue(self.logged.wait(3))
+                self.assertEqual(status, 429 if failure == "quota" else 200)
+                self.assertTrue(all(model == jev.LUNA and effort == actual for model, effort, actual in served))
+                self.assertEqual([effort for _, effort, _ in served],
+                                 ["max", "high"] if failure == "empty_completion" else ["max"])
+                self.assertEqual(self.records[-1]["sol_effort_cap"], "low")
+
     def test_picker_high_is_sol_ceiling_not_a_luna_effort_override(self):
+        self.write_bounds(luna_min="low")
         body = routing.payload_for([routing.message("user", "Continue this bounded task.")],
                                    reasoning={"effort": "high"})
         DecisionEndpoint.answer = routing.answer(jev.SOL, "max")
@@ -343,6 +528,7 @@ class ClefRoutingWorkflow(unittest.TestCase):
         self.assertEqual(self.route(body)["effort"], "low")
 
     def test_all_picker_caps_preserve_every_luna_effort_and_valid_sol_pair(self):
+        self.write_bounds(luna_min="low")
         for cap in jev.EFFORTS:
             for model in jev.CLEF_MODELS:
                 for effort in jev.EFFORTS:
@@ -555,6 +741,7 @@ class ClefRoutingWorkflow(unittest.TestCase):
                             jev._lease_contract_fingerprint({"_router_lease_mode": "auto-deep"}))
 
     def test_successful_diagnostic_words_keep_lease_but_nonzero_status_reconsiders(self):
+        self.write_bounds(luna_min="low")
         opening = [routing.message("user", "Inspect these logs.")]
         DecisionEndpoint.answer = clef_answer(jev.LUNA, "low", lease="user_turn")
         self.route(routing.payload_for(opening, reasoning={"effort": "low"}))
@@ -584,6 +771,8 @@ class ClefRoutingWorkflow(unittest.TestCase):
         self.assertEqual(routing.Edge.payloads[-1]["prompt_cache_key"], chat)
 
     def test_large_diagnostics_replay_stably_with_cache_affinity_and_retrievable_output(self):
+        self.write_bounds(luna_min="low")
+        DecisionEndpoint.answer = clef_answer(jev.LUNA, "low")
         from diagnostic_output import MAX_OUTPUT_BYTES
         raw = "Process exited with code 0\nFinal output:\n" + "diagnostic row\n" * 5000
         opening = [routing.message("user", "Inspect these supplied diagnostics.")]
@@ -606,7 +795,7 @@ class ClefRoutingWorkflow(unittest.TestCase):
         self.assertNotIn(raw, json.dumps(record))
 
     def test_verified_checks_reconsider_leases_and_feed_actual_outcomes_to_clef(self):
-        DecisionEndpoint.answer = clef_answer(jev.LUNA, "low", lease="user_turn")
+        DecisionEndpoint.answer = clef_answer(jev.LUNA, "medium", lease="user_turn")
         items = [routing.message("user", "Fix the failing unit test and verify it.")]
         self.route(routing.payload_for(items))
         initial = jev.feedback_for(jev.STATE).context("pck-thread-1")
@@ -620,8 +809,7 @@ class ClefRoutingWorkflow(unittest.TestCase):
                       {"type": "function_call_output", "call_id": call_id,
                        "output": json.dumps({"exit_code": code,
                                              "output": "FAILED (failures=1)" if code else "Ran 1 test\nOK"})}]
-            DecisionEndpoint.answer = clef_answer(jev.SOL if code else jev.LUNA,
-                                                 "medium" if code else "low", lease="user_turn")
+            DecisionEndpoint.answer = clef_answer(jev.SOL if code else jev.LUNA, "medium", lease="user_turn")
             record = self.route(routing.payload_for(items))
             self.assertEqual(record["decision_source"], "clef")
             self.assertEqual(record["verification"]["outcome"], "fail" if code else "pass")
@@ -630,7 +818,7 @@ class ClefRoutingWorkflow(unittest.TestCase):
             self.assertEqual(context["recent_verification"], record["verification"])
             self.assertEqual(sum(row["verified_failures"] for row in context["route_statistics"]), min(number, 2))
             self.assertEqual(sum(row["verified_passes"] for row in context["route_statistics"]), int(not code))
-            self.assertEqual(record["effort"], "medium" if code else "low")
+            self.assertEqual(record["effort"], "medium")
 
         requests = len(DecisionEndpoint.requests)
         replay = self.route(routing.payload_for(items))
@@ -706,7 +894,7 @@ class ClefRoutingWorkflow(unittest.TestCase):
             self.assertTrue(finished.wait(3))
         context = DecisionEndpoint.requests[-1][2]["state"]["effort_policy"]["feedback"]
         self.assertEqual(context["recent_verification"]["attributed_route"],
-                         {"model": jev.LUNA, "effort": "low"})
+                         {"model": jev.LUNA, "effort": "medium"})
         self.assertEqual(sum(row["verified_failures"] for row in context["route_statistics"]), 1)
 
     def test_disconnected_error_response_still_records_attempt_cost(self):
@@ -784,8 +972,10 @@ class ClefRoutingWorkflow(unittest.TestCase):
         _, raw = self.request("/health")
         self.assertEqual(json.loads(raw)["auto_modes"]["auto"]["efforts"], list(jev.EFFORTS))
         health = json.loads(raw)
-        self.assertEqual(health["effort_policy"], "sol-cap-v1")
-        self.assertEqual(health["luna_efforts"], list(jev.EFFORTS))
+        self.assertEqual(health["effort_policy"], "effort-bounds-v1")
+        self.assertEqual(health["luna_efforts"], list(jev.EFFORTS[1:]))
+        self.assertEqual(health["effort_bounds"], {"luna": {"min": "medium", "max": "max"},
+                                                 "sol": {"min": "low", "max": "max"}})
         self.assertEqual(health["sol_effort_caps"], list(jev.EFFORTS))
         self.assertEqual(health["default_sol_effort_cap"], "medium")
         self.assertEqual(health["legacy_sol_effort_caps"], {"auto-cheap": "low", "auto-deep": "high"})

@@ -140,7 +140,8 @@ def verify_clef_adapter():
     with local_opener().open("http://127.0.0.1:4319/health", timeout=5) as response:
         health = json.load(response)
     expected = {"decision_provider": "clef", "decision_model": "clef-flash",
-                "decision_configured": True, "baseline_model": "gpt-6.1-sol"}
+                "decision_configured": True, "baseline_model": "gpt-6.1-sol",
+                "effort_policy": "effort-bounds-v1"}
     if not health.get("ok") or any(health.get(key) != value for key, value in expected.items()):
         raise RuntimeError("The running adapter does not match the local Clef profile")
 
@@ -276,7 +277,7 @@ def main():
     print(json.dumps({"installed": "clef", "model": "jev/auto", "models": list(PICKER_MODELS),
                       "display": "Auto (Clef)", "models_preset": str(preset_file),
                       "sleep_idle_seconds": args.sleep_idle_seconds,
-                      "next": "Restart Codex when convenient, then select Auto (Clef). Effort sets the maximum Sol effort; Luna can use any effort."}))
+                      "next": "Restart Codex when convenient, then select Auto (Clef). Effort sets the maximum Sol effort; use effort-policy to set model floors and ceilings."}))
 
 
 if __name__ == "__main__":

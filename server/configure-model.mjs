@@ -16,16 +16,16 @@ export const JEV_MODEL = Object.freeze({
   displayName: isClef ? "Auto (Clef)" : "Auto (Jev)",
   description:
     isClef
-      ? "Clef chooses GPT-6 Luna at any effort or GPT-6.1 Sol up to your selected effort. The effort selector sets the maximum Sol effort."
+      ? "Clef chooses GPT-6 Luna or GPT-6.1 Sol within your configured effort bounds. The effort selector sets the maximum Sol effort."
       : "Auto-routing by Jev: calls use GPT-6 Luna, GPT-6.1 Sol, or GPT-6 Astra at the reasoning depth they need.",
   priority: 95,
   defaultEffort: "medium",
   reasoningLevels: [
-    { effort: "low", description: isClef ? "Maximum Sol effort: low. Luna may use any effort." : "Quick reasoning" },
-    { effort: "medium", description: isClef ? "Maximum Sol effort: medium. Luna may use any effort." : "Balanced reasoning" },
-    { effort: "high", description: isClef ? "Maximum Sol effort: high. Luna may use any effort." : "Deep reasoning" },
-    { effort: "xhigh", description: isClef ? "Maximum Sol effort: extra high. Luna may use any effort." : "Extended reasoning" },
-    { effort: "max", description: isClef ? "Maximum Sol effort: max. Luna may use any effort." : "Maximum reasoning" },
+    { effort: "low", description: isClef ? "Maximum Sol effort: low. Luna follows your effort bounds." : "Quick reasoning" },
+    { effort: "medium", description: isClef ? "Maximum Sol effort: medium. Luna follows your effort bounds." : "Balanced reasoning" },
+    { effort: "high", description: isClef ? "Maximum Sol effort: high. Luna follows your effort bounds." : "Deep reasoning" },
+    { effort: "xhigh", description: isClef ? "Maximum Sol effort: extra high. Luna follows your effort bounds." : "Extended reasoning" },
+    { effort: "max", description: isClef ? "Maximum Sol effort: max. Luna follows your effort bounds." : "Maximum reasoning" },
   ],
   contextWindow: 258400,
   autoCompact: 219640,

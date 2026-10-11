@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 
 from healthcheck import healthy
+from effort_bounds import allowed_efforts, validate_bounds
 from local_runtime import STATE
 from routing_policy import EFFORTS, POLICY_VERSION, SOL, TIERS
 
@@ -18,7 +19,7 @@ def main():
     parser.add_argument("--expect-effort", choices=EFFORTS,
                         help="Require an exact effort for this trivial live request")
     parser.add_argument("--sol-effort-cap", choices=EFFORTS,
-                        help="Maximum Sol effort; Luna retains every effort")
+                        help="Maximum Sol effort, intersected with configured effort bounds")
     args = parser.parse_args()
     if not healthy():
         raise RuntimeError("local health check failed")
@@ -83,7 +84,7 @@ def main():
         if (
             not isinstance(route, dict)
             or route.get("decision_source") != decision_provider
-            or route.get("gate") not in ("apply", "astra_policy", "clef_sol_ceiling")
+            or route.get("gate") not in ("apply", "astra_policy", "clef_sol_ceiling", "clef_effort_bounds")
             or route.get("status") != 200
             or route.get("completion_status") != "response.completed"
         ):
@@ -97,18 +98,19 @@ def main():
         ):
             raise RuntimeError("Clef attempted a model outside its execution ceiling")
         if decision_provider == "clef":
-            if health_data.get("effort_policy") != "sol-cap-v1":
-                raise RuntimeError("The live adapter does not enforce the Sol effort ceiling")
-            if (health_data.get("luna_efforts") != EFFORTS
+            if health_data.get("effort_policy") != "effort-bounds-v1":
+                raise RuntimeError("The live adapter does not enforce configured effort bounds")
+            bounds = validate_bounds(health_data.get("effort_bounds"))
+            if (health_data.get("luna_efforts") != allowed_efforts("luna", bounds)
                     or sol_cap not in health_data.get("sol_effort_caps", [])
                     or route.get("auto_mode") != mode
-                    or route.get("sol_effort_cap") != sol_cap):
-                raise RuntimeError("The live route did not apply the selected Sol effort ceiling")
+                    or route.get("sol_effort_cap") != sol_cap
+                    or route.get("effort_bounds") != bounds):
+                raise RuntimeError("The live route did not apply the configured effort bounds")
             for attempt in [route, *route.get("attempts", [])]:
                 effort = attempt.get("effort")
-                if effort not in EFFORTS or (attempt.get("model") == SOL
-                        and EFFORTS.index(effort) > EFFORTS.index(sol_cap)):
-                    raise RuntimeError("Clef attempted Sol reasoning above the selected ceiling")
+                if effort not in allowed_efforts(attempt.get("model"), bounds, sol_cap):
+                    raise RuntimeError("Clef attempted reasoning outside its configured bounds")
         if args.expect_effort and route.get("effort") != args.expect_effort:
             raise RuntimeError("The live route did not select the expected reasoning effort")
         if response_model != route["model"]:
@@ -117,7 +119,7 @@ def main():
         if expected_label not in "".join(output_text)[:240]:
             raise RuntimeError("the streamed assistant text did not show its routed model and effort")
         result.update({key: route.get(key) for key in (
-            "model", "effort", "effort_transport", "gate", "decision_source", "auto_mode", "effort_policy", "sol_effort_cap"
+            "model", "effort", "effort_transport", "gate", "decision_source", "auto_mode", "effort_policy", "sol_effort_cap", "effort_bounds"
         )})
         result["response_model"] = response_model
         result["visible_model_effort"] = "confirmed"

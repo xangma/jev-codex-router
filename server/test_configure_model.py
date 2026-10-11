@@ -44,7 +44,7 @@ class ConfigureAutoModes(unittest.TestCase):
                 self.assertEqual(entry["defaultEffort"], default_effort)
                 self.assertEqual(entry["listed"], entry["slug"] == "jev/auto")
                 self.assertIn("maximum Sol effort", entry["description"])
-                self.assertTrue(all("Luna may use any effort" in level["description"]
+                self.assertTrue(all("Luna follows your effort bounds" in level["description"]
                                     for level in entry["reasoningLevels"]))
                 self.assertNotIn("Astra", entry["description"])
                 self.assertNotIn("through", entry["description"])

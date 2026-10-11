@@ -22,6 +22,7 @@ Commands:
   doctor                    Check the Jev service and embedded router
   smoke                     Run the Jev end-to-end smoke test
   report [ARGS...]          Report observed routing and cache usage
+  effort-policy ARGS...     Show or set Clef effort floors and ceilings
   uninstall [--revoke-session] Stop Jev and disable its model/provider
   help                      Show this help
 EOF
@@ -46,6 +47,7 @@ case "$command" in
     ;;
   smoke) exec python3 "$repo_dir/server/smoke.py" "$@" ;;
   report) exec python3 "$repo_dir/server/report_routing.py" "$@" ;;
+  effort-policy) exec python3 "$repo_dir/server/effort_bounds.py" "$@" ;;
   uninstall) exec "$repo_dir/server/uninstall.sh" "$@" ;;
   help|-h|--help) usage ;;
   *) usage >&2; exit 2 ;;

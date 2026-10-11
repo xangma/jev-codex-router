@@ -61,9 +61,11 @@ class ClefInstallTransport(unittest.TestCase):
 
     def test_verify_rejects_hosted_or_misconfigured_adapter(self):
         expected = {"ok": True, "decision_provider": "clef", "decision_model": "clef-flash",
-                    "decision_configured": True, "baseline_model": "gpt-6.1-sol"}
+                    "decision_configured": True, "baseline_model": "gpt-6.1-sol",
+                    "effort_policy": "effort-bounds-v1"}
         for overrides in [{"decision_provider": "jev"}, {"decision_configured": False},
-                          {"decision_model": "other"}, {"baseline_model": "gpt-6-astra"}]:
+                          {"decision_model": "other"}, {"baseline_model": "gpt-6-astra"},
+                          {"effort_policy": "sol-cap-v1"}]:
             with self.subTest(overrides=overrides), patch.object(installer, "local_opener") as opener:
                 opener.return_value.open.return_value = io.BytesIO(json.dumps(expected | overrides).encode())
                 with self.assertRaises(RuntimeError):

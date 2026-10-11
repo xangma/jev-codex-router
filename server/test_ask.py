@@ -146,7 +146,7 @@ class AskEndpointTests(unittest.TestCase):
         }
         seen = {}
 
-        def fake_call_jev(key, state, questions, timeout=None):
+        def fake_call_jev(key, state, questions, timeout=None, config=None):
             seen.update(key=key, state=state, questions=questions)
             return {
                 "model": "jev-1.13.0",

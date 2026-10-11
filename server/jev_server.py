@@ -111,6 +111,7 @@ from adaptive_feedback import feedback_for
 from diagnostic_output import preview_tool_outputs
 from tool_results import output_text, tool_result_failed
 from decision_cache import DecisionCache, model_version
+from effort_bounds import allowed_efforts, clamp_effort, load_bounds
 
 from routing_policy import (ASTRA, EFFORTS, LUNA, NATIVE_MODELS, POLICY_VERSION, QUESTIONS, SOL, TERRA,
                             TIERS, _validated_choice, decision_from_answers, route)
@@ -137,7 +138,7 @@ VERSION = "1.6"
 API = "https://api.typesafe.ai/v1/systemone"
 MODEL = "jev-latest"
 CLEF_MODELS = (LUNA, SOL)
-CLEF_EFFORT_POLICY = "sol-cap-v1"
+CLEF_EFFORT_POLICY = "effort-bounds-v1"
 CLEF_DEFAULT_CAPS = {"auto-cheap": "low", "auto": "medium", "auto-deep": "high"}
 CLEF_MODES = {
     "auto-cheap": {"name": "Cheap", "efforts": EFFORTS,
@@ -182,22 +183,39 @@ def clef_sol_cap(payload=None, mode="auto"):
     return cap
 
 
-def clef_effort(mode, effort, model=None, sol_cap=None):
-    """Bound Sol at final dispatch, without changing any valid Luna effort."""
+def clef_bounds(bounds=None):
+    return bounds if bounds is not None else load_bounds(
+        os.environ.get("CLEF_EFFORT_BOUNDS_FILE") or os.path.join(STATE, "clef-effort-bounds.json"))
+
+
+def clef_effort(mode, effort, model=None, sol_cap=None, bounds=None):
+    """Apply configured model bounds and intersect Sol with the picker ceiling."""
     effort = effort if effort in EFFORTS else "medium"
-    if model == SOL:
+    if model in CLEF_MODELS:
         cap = sol_cap if sol_cap in EFFORTS else CLEF_DEFAULT_CAPS[mode]
-        effort = EFFORTS[min(EFFORTS.index(effort), EFFORTS.index(cap))]
+        effort = clamp_effort(model, effort, clef_bounds(bounds), cap)
     return effort
 
 
-def clef_questions(mode="auto", sol_cap=None):
+def clef_route(model, effort, mode="auto", sol_cap=None, bounds=None):
+    """One authoritative model/effort normalization for every Clef relay attempt."""
+    bounds = clef_bounds(bounds)
+    cap = sol_cap if sol_cap in EFFORTS else CLEF_DEFAULT_CAPS[mode]
+    if model == ASTRA:
+        model = SOL
+    if model not in CLEF_MODELS:
+        raise ValueError("Clef execution is restricted to Luna or Sol")
+    if model == SOL and not allowed_efforts(SOL, bounds, cap):
+        model = LUNA
+    return model, clef_effort(mode, effort, model, cap, bounds)
+
+
+def clef_questions(mode="auto", sol_cap=None, bounds=None):
+    bounds = clef_bounds(bounds)
     cap = sol_cap if sol_cap in EFFORTS else CLEF_DEFAULT_CAPS[mode]
     criteria = {}
     for name, model in (("luna", LUNA), ("sol", SOL)):
-        for effort in EFFORTS:
-            if model == SOL and EFFORTS.index(effort) > EFFORTS.index(cap):
-                continue
+        for effort in allowed_efforts(model, bounds, cap):
             criteria[f"{name}_{effort}"] = (
                 CLEF_QUESTIONS["model"]["criteria"][name] + " Reasoning effort " + effort + ": "
                 + QUESTIONS["effort"]["criteria"][effort])
@@ -205,8 +223,9 @@ def clef_questions(mode="auto", sol_cap=None):
         "Choose the least costly sufficient model and effort pair for remaining work. Only "
         "Luna and Sol are allowed; Astra is forbidden. Model capability and effort are separate: "
         "do not choose Sol merely to increase effort, and do not automatically raise Luna effort. "
-        "Every Luna effort is eligible. Sol effort cannot exceed the user's hard cap " + cap + ". "
-        "The Sol cap is an upper limit, not a target; lower Sol effort remains eligible. "
+        "Only the listed pairs are eligible under the user's model effort floors and ceilings. "
+        "Sol effort cannot exceed the user's hard cap " + cap + ". "
+        "The Sol cap is an upper limit, not a target; lower Sol effort is eligible only when listed. "
         "At current native rates Luna uncached input/output costs about 1/20 of Sol and cached "
         "input about 1/10. Compare total reasoning, tool, retry, clarification and cached input "
         "costs without sacrificing required capability. Use the lowest sufficient effort. "
@@ -218,20 +237,26 @@ def clef_questions(mode="auto", sol_cap=None):
     ), "criteria": criteria}, "lease": QUESTIONS["lease"]}
 
 
-def execution_decision(decision, provider, mode="auto", sol_cap=None):
+def execution_decision(decision, provider, mode="auto", sol_cap=None, bounds=None):
     """Clef's explicit user ceiling applies to old leases and old policy answers too."""
     if provider == "clef":
         decision = {**decision}
         if decision["model"] == ASTRA:
             decision.update(model=SOL, requested_model=ASTRA, gate="clef_sol_ceiling")
-        decision["effort"] = clef_effort(mode, decision["effort"], decision["model"], sol_cap)
+        before_model = decision["model"]
+        decision["model"], decision["effort"] = clef_route(
+            decision["model"], decision["effort"], mode, sol_cap, bounds)
+        if decision["model"] != before_model:
+            decision.setdefault("requested_model", before_model)
+            decision["gate"] = "clef_effort_bounds"
     return decision
 
 
-def provider_decision(answers, provider, mode="auto", sol_cap=None):
+def provider_decision(answers, provider, mode="auto", sol_cap=None, bounds=None):
     if provider == "clef" and isinstance(answers, dict):
+        bounds = clef_bounds(bounds)
         if "route" in answers:
-            choices = clef_questions(mode, sol_cap)["route"]["criteria"]
+            choices = clef_questions(mode, sol_cap, bounds)["route"]["criteria"]
             choice, probabilities, confidence = _validated_choice(answers, "route", choices)
             name, effort = choice.split("_", 1)
             decision = decision_from_answers({
@@ -250,7 +275,7 @@ def provider_decision(answers, provider, mode="auto", sol_cap=None):
                     for depth in EFFORTS}
                 lease_probability = decision["chosen_probability"]
                 decision["chosen_probability"] = min(probabilities[choice], lease_probability) if lease_probability is not None else probabilities[choice]
-            return execution_decision(decision, provider, mode, sol_cap)
+            return execution_decision(decision, provider, mode, sol_cap, bounds)
         # Compatibility for historical independent decisions and old leases.
         answers = {**answers}
         answers.setdefault("astra_policy", {"choice": "normal"})
@@ -264,7 +289,7 @@ def provider_decision(answers, provider, mode="auto", sol_cap=None):
             probabilities = effort["probabilities"]
             if set(probabilities) == set(CLEF_MODES[mode]["efforts"]):
                 answers["effort"] = {**effort, "probabilities": {key: probabilities.get(key, 0) for key in EFFORTS}}
-    return execution_decision(decision_from_answers(answers), provider, mode, sol_cap)
+    return execution_decision(decision_from_answers(answers), provider, mode, sol_cap, bounds)
 
 
 def decision_config(default_timeout=4.0):
@@ -303,8 +328,11 @@ def decision_config(default_timeout=4.0):
             raise ValueError("CLEF_MODEL must be configured")
         if not os.environ.get("CLEF_API_KEY_FILE", "").strip():
             raise ValueError("CLEF_API_KEY_FILE must be configured")
-    return {"provider": provider, "endpoint": endpoint, "model": model,
-            "timeout": timeout, "baseline": baseline}
+    config = {"provider": provider, "endpoint": endpoint, "model": model,
+              "timeout": timeout, "baseline": baseline}
+    if provider == "clef":
+        config["effort_bounds"] = clef_bounds()
+    return config
 
 
 def load_clef_key():
@@ -342,7 +370,8 @@ def decision_health():
                 "decision_timeout": config["timeout"], "baseline_model": config["baseline"],
                 "allowed_execution_models": list(CLEF_MODELS if config["provider"] == "clef" else TIERS),
                 **({"auto_modes": CLEF_MODES, "effort_policy": CLEF_EFFORT_POLICY,
-                    "luna_efforts": list(EFFORTS), "sol_effort_caps": list(EFFORTS),
+                    "effort_bounds": config["effort_bounds"],
+                    "luna_efforts": allowed_efforts(LUNA, config["effort_bounds"]), "sol_effort_caps": list(EFFORTS),
                     "default_sol_effort_cap": CLEF_DEFAULT_CAPS["auto"],
                     "legacy_sol_effort_caps": {key: value for key, value in CLEF_DEFAULT_CAPS.items() if key != "auto"},
                     "clef_decision_cache": CLEF_CACHE.statistics()}
@@ -846,20 +875,20 @@ class _NoDecisionRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def call_jev_routed(key, state, questions=None, timeout=None):
+def call_jev_routed(key, state, questions=None, timeout=None, config=None):
     """One System One call to the selected provider; no cross-provider retries.
 
     The historical key argument remains for Jev callers. Clef always reads its
     own key file so replay tools cannot accidentally send a hosted credential.
     """
-    config = decision_config(default_timeout=4.0 if timeout is None else timeout)
+    config = decision_config(default_timeout=4.0 if timeout is None else timeout) if config is None else config
     if config["provider"] == "jev":
         return call_jev(key, state, questions, timeout=config["timeout"])
     clef_key = load_clef_key()
     if not clef_key:
         raise ValueError("Clef API key is not configured in a protected file")
     payload = {"model": config["model"], "state": state,
-               "questions": clef_questions() if questions is None else questions}
+               "questions": clef_questions(bounds=config["effort_bounds"]) if questions is None else questions}
     req = urllib.request.Request(
         config["endpoint"],
         data=json.dumps(payload).encode(),
@@ -1467,6 +1496,8 @@ def _lease_contract_fingerprint(payload):
         contract["auto_mode"] = payload["_router_lease_mode"]
     if "_router_sol_effort_cap" in payload:
         contract["sol_effort_cap"] = payload["_router_sol_effort_cap"]
+    if "_router_effort_bounds" in payload:
+        contract["effort_bounds"] = payload["_router_effort_bounds"]
     try:
         encoded = json.dumps(
             contract, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -2366,7 +2397,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(503, {"error": {"message": f"{provider} API key is not configured"}})
         t0 = time.time()
         try:
-            answer = call_jev_routed(key, state, questions, timeout=ASK_TIMEOUT)
+            answer = call_jev_routed(key, state, questions, timeout=ASK_TIMEOUT, config=config)
         except Exception:
             return self._json(502, {"error": {"message": f"{provider} provider unavailable"}})
         return self._json(200, {
@@ -2433,7 +2464,10 @@ class Handler(BaseHTTPRequestHandler):
         payload = self._body(RESPONSE_MAX_BYTES)
         if payload is None:
             return
-        config = decision_config()
+        try:
+            config = decision_config()
+        except ValueError as exc:
+            return self._json(503, {"error": {"message": str(exc)}})
         provider = config["provider"]
         baseline = config["baseline"]
         mode = payload.get("model", "auto") if provider == "clef" else None
@@ -2473,6 +2507,9 @@ class Handler(BaseHTTPRequestHandler):
         provider, baseline = config["provider"], config["baseline"]
         mode = payload.get("model", "auto") if provider == "clef" else None
         sol_cap = clef_sol_cap(payload, mode) if mode is not None else None
+        bounds = config.get("effort_bounds") if mode is not None else None
+        if mode is not None:
+            baseline, _ = clef_route(baseline, None, mode, sol_cap, bounds)
         # Our own answer signatures never travel back upstream (see
         # strip_signatures): the model must not read its own route tag.
         stripped = strip_signatures(payload)
@@ -2498,7 +2535,8 @@ class Handler(BaseHTTPRequestHandler):
         decision_source = None
         scope = cache_scope(payload, task)
         lease_scope = f"{scope}:clef:{mode}" if mode is not None else scope
-        lease_payload = ({**payload, "_router_lease_mode": mode, "_router_sol_effort_cap": sol_cap}
+        lease_payload = ({**payload, "_router_lease_mode": mode, "_router_sol_effort_cap": sol_cap,
+                          "_router_effort_bounds": bounds}
                          if mode is not None else payload)
         feedback, feedback_scope = self._feedback, self._feedback_scope
         verification = feedback.observe(feedback_scope, payload) if feedback is not None else None
@@ -2523,7 +2561,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             key = load_decision_key(config)
             if leased is not None:
-                decision = execution_decision(leased, provider, mode, sol_cap)
+                decision = execution_decision(leased, provider, mode, sol_cap, bounds)
                 tier, depth, conf = (
                     decision["model"], decision["effort"], decision["confidence"]
                 )
@@ -2536,17 +2574,18 @@ class Handler(BaseHTTPRequestHandler):
                 if mode is not None:
                     state["effort_policy"] = {
                         "mode": mode, "preference": CLEF_MODES[mode]["preference"],
-                        "sol_effort_cap": sol_cap, "luna_efforts": list(EFFORTS),
+                        "sol_effort_cap": sol_cap, "effort_bounds": bounds,
+                        "luna_efforts": allowed_efforts(LUNA, bounds),
                         "feedback": adaptive_context,
                     }
                 failure_evidence = route_failure_evidence(scope, payload)
                 if failure_evidence:
                     state["recent_route_failure"] = failure_evidence
                 try:
-                    result = (call_jev_routed(key, state, clef_questions(mode, sol_cap))
+                    result = (call_jev_routed(key, state, clef_questions(mode, sol_cap, bounds), config=config)
                               if mode is not None else call_jev_routed(key, state))
                     decision_cache = result.get("decision_cache") if mode is not None else None
-                    decision = provider_decision(result.get("answers"), provider, mode, sol_cap)
+                    decision = provider_decision(result.get("answers"), provider, mode, sol_cap, bounds)
                     raw_usage = result.get("usage") or {}
                     if not isinstance(raw_usage, dict):
                         raw_usage = {}
@@ -2567,7 +2606,7 @@ class Handler(BaseHTTPRequestHandler):
                 decision_source = "technical_fallback"
 
         if mode is not None:
-            effort = clef_effort(mode, effort or (payload.get("reasoning") or {}).get("effort"), model, sol_cap)
+            model, effort = clef_route(model, effort or (payload.get("reasoning") or {}).get("effort"), mode, sol_cap, bounds)
 
         shadow_enabled = os.path.exists(SHADOW_PATH)
 
@@ -2577,7 +2616,7 @@ class Handler(BaseHTTPRequestHandler):
             label = {LUNA: "luna", SOL: "sol", ASTRA: "astra"}[baseline]
             model, effort, speed, gate = baseline, None, "default", f"shadow({label})"
             if mode is not None:
-                effort = clef_effort(mode, (payload.get("reasoning") or {}).get("effort"), model, sol_cap)
+                model, effort = clef_route(model, (payload.get("reasoning") or {}).get("effort"), mode, sol_cap, bounds)
 
         # ONLY while native usage is exhausted (manual flag or observed quota
         # failure), replace the OpenAI ladder with locally discovered configured
@@ -2591,7 +2630,9 @@ class Handler(BaseHTTPRequestHandler):
             candidates = fallback_candidates(native_model, payload)
             # An opaque configured alias could resolve to Astra. Clef's hard
             # user ceiling permits only the two explicit native model IDs.
-            return ([candidate for candidate in candidates if candidate in CLEF_MODELS]
+            return ([candidate for candidate in candidates if candidate in CLEF_MODELS
+                     and allowed_efforts(candidate, bounds, sol_cap)
+                     and candidate not in {attempt.get("model") for attempt in self._attempts}]
                     if provider == "clef" else candidates)
 
         if dry_reason and model in TIERS:
@@ -2608,7 +2649,7 @@ class Handler(BaseHTTPRequestHandler):
         # Display the model actually serving the request, including shadow and
         # operational fallbacks, rather than a hypothetical classification.
         if mode is not None:
-            effort = clef_effort(mode, effort, model, sol_cap)
+            model, effort = clef_route(model, effort, mode, sol_cap, bounds)
         shown = {"model": model, "effort": effort or (payload.get("reasoning") or {}).get("effort")}
         marker = route_marker(shown["model"], shown["effort"])
         signature = presentation_signature(payload, shown)
@@ -2626,10 +2667,10 @@ class Handler(BaseHTTPRequestHandler):
             reasoning = original_reasoning
             cached_updates = _cached_updates(scope, model, canonical_signature, _cache_ttl_seconds(payload))
             if mode is not None:
-                effort = clef_effort(mode, effort, model, sol_cap)
+                model, effort = clef_route(model, effort, mode, sol_cap, bounds)
                 reasoning = dict(original_reasoning or {})
-                reasoning["effort"] = clef_effort(mode, reasoning.get("effort") or effort, model, sol_cap)
-                cached_updates = tuple((index, clef_effort(mode, previous, model, sol_cap)) for index, previous in cached_updates)
+                reasoning["effort"] = clef_effort(mode, reasoning.get("effort") or effort, model, sol_cap, bounds)
+                cached_updates = tuple((index, clef_effort(mode, previous, model, sol_cap, bounds)) for index, previous in cached_updates)
             applied_updates, effort_transport = apply_route_payload(
                 payload, model, effort, reasoning, canonical_items, cached_updates,
             )
@@ -2642,7 +2683,7 @@ class Handler(BaseHTTPRequestHandler):
                         item = {key: value for key, value in item.items() if key != "model"}
                         if isinstance(item.get("reasoning"), dict):
                             item["reasoning"] = {**item["reasoning"],
-                                                 "effort": clef_effort(mode, item["reasoning"].get("effort"), model, sol_cap)}
+                                                 "effort": clef_effort(mode, item["reasoning"].get("effort"), model, sol_cap, bounds)}
                         if set(item) == {"type"}:
                             continue
                     bounded_items.append(item)
@@ -2727,7 +2768,7 @@ class Handler(BaseHTTPRequestHandler):
             # Do not re-enter native service after a quota/provider fallback.
             recovery_model, recovery_effort = (SOL if provider == "clef" else ASTRA), "medium"
             if mode is not None:
-                recovery_effort = clef_effort(mode, recovery_effort, recovery_model, sol_cap)
+                recovery_model, recovery_effort = clef_route(recovery_model, recovery_effort, mode, sol_cap, bounds)
             if (model, effort) != (recovery_model, recovery_effort):
                 model, effort = recovery_model, recovery_effort
                 model, effort = apply_route(model, effort)
@@ -2795,6 +2836,7 @@ class Handler(BaseHTTPRequestHandler):
             "auto_mode": mode,
             "effort_policy": CLEF_EFFORT_POLICY if mode is not None else None,
             "sol_effort_cap": sol_cap,
+            "effort_bounds": bounds,
             "verification": verification,
             "tool_output_preview": output_preview,
             "lease": decision.get("lease") if decision else None,

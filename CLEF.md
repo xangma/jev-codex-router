@@ -6,27 +6,59 @@ endpoint. Clef selects the execution model and reasoning effort; Codex work stil
 runs on your signed-in ChatGPT plan. There is no hosted Jev request in this profile.
 
 The Codex picker exposes **Auto (Clef)** (`jev/auto`). Its effort selector sets
-the **maximum GPT-6.1 Sol effort**, with medium as the default. **GPT-6 Luna can
-use low, medium, high, xhigh or max at every selector setting.** Astra is blocked.
+the **maximum GPT-6.1 Sol effort**, with medium as the default. **GPT-6 Luna defaults
+to medium, high, xhigh or max at every selector setting.** Luna low is excluded.
+Each model also has an editable effort floor and ceiling. Astra is blocked.
 
 | Selected effort | Luna choices | Sol choices |
 |---|---|---|
-| low | All five efforts | low |
-| medium | All five efforts | low, medium |
-| high | All five efforts | low, medium, high |
-| xhigh | All five efforts | low, medium, high, xhigh |
-| max | All five efforts | All five efforts |
+| low | medium, high, xhigh, max | low |
+| medium | medium, high, xhigh, max | low, medium |
+| high | medium, high, xhigh, max | low, medium, high |
+| xhigh | medium, high, xhigh, max | low, medium, high, xhigh |
+| max | medium, high, xhigh, max | All five efforts |
 
 Clef jointly chooses a model and effort from the permitted pairs, balancing
 sufficient capability against total task cost and measured cache evidence.
 Increasing the ceiling expands its choices without forcing higher effort or
 removing Luna. A low ceiling can still select Luna at max, so the selector is
-not an overall token or latency budget. No combinations are removed on the
-assumption that one effort name implies better capability than another model.
+not an overall token or latency budget. The table shows the default model ranges;
+configured ranges further restrict these choices.
 
 The old `jev/auto-cheap` and `jev/auto-deep` routes remain hidden aliases for
 existing conversations, defaulting to a low or high Sol ceiling respectively.
 An explicitly selected effort takes precedence over those defaults.
+
+## Effort floors and ceilings
+
+```sh
+bin/jev-codex-router effort-policy show
+bin/jev-codex-router effort-policy set --luna-min high --luna-max xhigh
+bin/jev-codex-router effort-policy set --sol-min medium --sol-max high
+bin/jev-codex-router effort-policy reset
+```
+
+Settings are stored in `~/.codex/codex-router/clef-effort-bounds.json` and apply
+on the next request without a service or Codex restart. The defaults are:
+
+```json
+{
+  "luna": {"min": "medium", "max": "max"},
+  "sol": {"min": "low", "max": "max"}
+}
+```
+
+Supported values are `low`, `medium`, `high`, `xhigh`, and `max`. To opt Luna low
+back in, set `--luna-min low`. Sol's effective ceiling is the lower of its configured
+maximum and the picker effort. If the picker ceiling is below Sol's floor, Sol
+is unavailable for that request; Luna remains available within its own range.
+The CLI rejects inverted ranges. Invalid JSON or invalid effort bounds stop
+new routing requests instead of silently discarding the restrictions.
+
+Bounds apply to subagents using Auto, fresh decisions, reused routes, replayed
+reasoning updates and operational fallbacks. Editing them invalidates old route
+leases. Alternate state directories follow the router's normal state configuration;
+`CLEF_EFFORT_BOUNDS_FILE` or the CLI's `--file PATH` selects another bounds file.
 
 ## Build and download
 
