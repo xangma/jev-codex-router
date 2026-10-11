@@ -112,6 +112,7 @@ from diagnostic_output import preview_tool_outputs
 from tool_results import output_text, tool_result_failed
 from decision_cache import DecisionCache, model_version
 from effort_bounds import allowed_efforts, clamp_effort, load_bounds
+from local_executor import load_executor
 
 from routing_policy import (ASTRA, EFFORTS, LUNA, NATIVE_MODELS, POLICY_VERSION, QUESTIONS, SOL, TERRA,
                             TIERS, _validated_choice, decision_from_answers, route)
@@ -148,6 +149,12 @@ CLEF_MODES = {
     "auto-deep": {"name": "Deep", "efforts": EFFORTS,
                   "preference": "Favour careful reasoning on difficult decisions. Use low effort for trivial work and routine execution."},
 }
+CLEF_ALL_MODES = {**CLEF_MODES, "auto-local": {
+    "name": "Local", "efforts": EFFORTS,
+    "preference": "Prefer the configured local executor when sufficient; use Sol when its capability is needed. "
+                  "Include replay, reasoning, retries and latency in total task cost. Cache never caps required capability.",
+}}
+
 CLEF_QUESTIONS = {
     "model": {
         **QUESTIONS["model"],
@@ -177,7 +184,7 @@ def clef_sol_cap(payload=None, mode="auto"):
         raise ValueError("Clef reasoning must be an object")
     cap = reasoning.get("effort") if reasoning else None
     if cap is None:
-        return CLEF_DEFAULT_CAPS[mode]
+        return CLEF_DEFAULT_CAPS.get(mode, CLEF_DEFAULT_CAPS["auto"])
     if not isinstance(cap, str) or cap not in EFFORTS:
         raise ValueError("unsupported Clef Sol effort cap")
     return cap
@@ -192,15 +199,29 @@ def clef_effort(mode, effort, model=None, sol_cap=None, bounds=None):
     """Apply configured model bounds and intersect Sol with the picker ceiling."""
     effort = effort if effort in EFFORTS else "medium"
     if model in CLEF_MODELS:
-        cap = sol_cap if sol_cap in EFFORTS else CLEF_DEFAULT_CAPS[mode]
+        cap = sol_cap if sol_cap in EFFORTS else CLEF_DEFAULT_CAPS.get(mode, CLEF_DEFAULT_CAPS["auto"])
         effort = clamp_effort(model, effort, clef_bounds(bounds), cap)
     return effort
 
 
-def clef_route(model, effort, mode="auto", sol_cap=None, bounds=None):
+def clef_route(model, effort, mode="auto", sol_cap=None, bounds=None, executor=None):
     """One authoritative model/effort normalization for every Clef relay attempt."""
     bounds = clef_bounds(bounds)
-    cap = sol_cap if sol_cap in EFFORTS else CLEF_DEFAULT_CAPS[mode]
+    cap = sol_cap if sol_cap in EFFORTS else CLEF_DEFAULT_CAPS.get(mode, CLEF_DEFAULT_CAPS["auto"])
+    if mode == "auto-local":
+        if not executor:
+            raise ValueError("Auto (Clef Local) requires a configured local executor")
+        if model in (ASTRA, LUNA):
+            model = SOL
+        if model == SOL and allowed_efforts(SOL, bounds, cap):
+            return model, clef_effort(mode, effort, model, cap, bounds)
+        if model == SOL:
+            model = executor["model"]
+        if model != executor["model"]:
+            raise ValueError("Auto (Clef Local) permits only the configured executor or Sol")
+        requested = EFFORTS.index(effort) if effort in EFFORTS else EFFORTS.index("medium")
+        chosen = min(executor["efforts"], key=lambda value: abs(EFFORTS.index(value) - requested))
+        return model, chosen
     if model == ASTRA:
         model = SOL
     if model not in CLEF_MODELS:
@@ -210,10 +231,112 @@ def clef_route(model, effort, mode="auto", sol_cap=None, bounds=None):
     return model, clef_effort(mode, effort, model, cap, bounds)
 
 
-def clef_questions(mode="auto", sol_cap=None, bounds=None):
+
+def local_transport_error(executor, clef_endpoint, snapshot=None):
+    """Inspect only configured transport metadata; never return endpoint or credentials."""
+    path = os.environ.get("MODEL_ROUTER_GENERIC_PROVIDERS") or os.path.join(STATE, "generic-providers.json")
+    try:
+        with open(os.path.expanduser(path), "rb") as handle:
+            raw = handle.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            raise ValueError("oversized provider state")
+        providers = json.loads(raw).get("providers", [])
+        provider = next((item for item in providers if isinstance(item, dict)
+                         and item.get("id") == executor["model"].split("/", 1)[0]), None)
+        if not provider or provider.get("enabled") is not True:
+            return "Local executor provider must be configured and enabled"
+        if provider.get("adapter") not in ("openai-chat", "openai-responses"):
+            return "Local executor requires a compatible generic provider adapter"
+        local_url = urllib.parse.urlsplit(provider.get("baseUrl", ""))
+        clef_url = urllib.parse.urlsplit(clef_endpoint)
+        def address(url):
+            host = url.hostname
+            try:
+                if ipaddress.ip_address(host).is_loopback:
+                    host = "loopback"
+            except ValueError:
+                if host == "localhost":
+                    host = "loopback"
+            return host, url.port or (443 if url.scheme == "https" else 80)
+        if local_url.scheme not in ("http", "https") or not local_url.hostname:
+            return "Local executor provider endpoint is invalid"
+        if address(local_url) == address(clef_url):
+            return "Local executor must use a separate serving endpoint from Clef to avoid model eviction"
+        models_path = os.environ.get("MODEL_ROUTER_USER_MODELS") or os.path.join(STATE, "user-models.json")
+        with open(os.path.expanduser(models_path), "rb") as handle:
+            raw_models = handle.read(1024 * 1024 + 1)
+        if len(raw_models) > 1024 * 1024:
+            raise ValueError("oversized model state")
+        models = json.loads(raw_models).get("models", [])
+        target = next((item for item in models if isinstance(item, dict)
+                       and item.get("slug") == executor["model"]), None)
+        if not target or target.get("provider") != provider["id"]:
+            return "Local executor must select an exact curated model for its configured provider"
+        upstream = target.get("upstreamModel")
+        if (not isinstance(upstream, str) or not upstream
+                or upstream in NATIVE_MODELS or upstream.split("/")[-1].startswith("gpt-")):
+            return "Local executor cannot alias a native GPT model"
+        window = target.get("contextWindow")
+        if (not isinstance(window, int) or isinstance(window, bool)
+                or executor["context_window"] > window):
+            return "Local executor context window exceeds the registered model capacity"
+        levels = target.get("reasoningLevels")
+        supported = {level.get("effort") for level in levels if isinstance(level, dict)} if isinstance(levels, list) else set()
+        if not set(executor["efforts"]).issubset(supported):
+            return "Local executor efforts must be supported by the registered model"
+        if snapshot is not None:
+            identity = {"endpoint": provider["baseUrl"], "adapter": provider["adapter"],
+                        "upstream": upstream, "context_window": window, "efforts": sorted(supported)}
+            snapshot["fingerprint"] = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:20]
+
+    except (OSError, ValueError, TypeError, AttributeError):
+        return "Local executor provider configuration is unavailable"
+    return None
+
+
+def local_replay_error(payload, executor):
+    """Conservative capability admission; never trim history to force a local fit."""
+    if payload.get("previous_response_id"):
+        return "Local execution requires full conversation replay"
+    constraints = _fallback_constraints(payload)
+    reasoning_output = payload.get("max_output_tokens")
+    reserve = reasoning_output if isinstance(reasoning_output, int) and not isinstance(reasoning_output, bool) else 8192
+    if constraints["estimated_tokens"] + max(0, reserve) > executor["context_window"]:
+        return "Conversation exceeds the local executor context window"
+    if constraints["image"]:
+        return "Local executor is configured for text input only"
+    if constraints["search_mode"] or constraints["search_history"]:
+        return "Native hosted search requires Sol"
+    return None
+
+def clef_questions(mode="auto", sol_cap=None, bounds=None, executor=None, local_eligible=True):
     bounds = clef_bounds(bounds)
-    cap = sol_cap if sol_cap in EFFORTS else CLEF_DEFAULT_CAPS[mode]
+    cap = sol_cap if sol_cap in EFFORTS else CLEF_DEFAULT_CAPS.get(mode, CLEF_DEFAULT_CAPS["auto"])
     criteria = {}
+    if mode == "auto-local":
+        if not executor:
+            raise ValueError("Auto (Clef Local) requires a configured local executor")
+        for effort in executor["efforts"] if local_eligible else ():
+            criteria[f"local_{effort}"] = (
+                executor["name"] + ": " + executor["description"] + " Reasoning effort " + effort + ": "
+                + QUESTIONS["effort"]["criteria"][effort])
+        for effort in allowed_efforts(SOL, bounds, cap):
+            criteria[f"sol_{effort}"] = (
+                CLEF_QUESTIONS["model"]["criteria"]["sol"] + " Reasoning effort " + effort + ": "
+                + QUESTIONS["effort"]["criteria"][effort])
+        return {"route": {"type": "choice", "instructions": (
+            "Choose the least costly sufficient model and effort pair for remaining work. Only the "
+            "configured local executor and Sol are allowed; Luna and Astra are forbidden. "
+            "Model capability and effort are separate. Use only listed pairs, honoring model bounds "
+            "and the user's hard Sol effort cap " + cap + ". The cap is an upper limit, not a target. "
+            + CLEF_ALL_MODES[mode]["preference"] + " Preserve a sufficient warm route for uniform work. "
+            "Local and GPT caches cannot transfer. A switch can require cold replay; cache evidence "
+            "is measured, not a guarantee. Local cache reuse also requires the recorded effort; "
+            "a different effort may change the chat-template prefix and require a fresh replay. "
+            "Never infer capability failure from quota, transport or "
+            "permission errors. Context size must fit the executor's context_window. "
+            "Use recent_route_failure and effort_policy.feedback for actual failed checks."
+        ), "criteria": criteria}, "lease": QUESTIONS["lease"]}
     for name, model in (("luna", LUNA), ("sol", SOL)):
         for effort in allowed_efforts(model, bounds, cap):
             criteria[f"{name}_{effort}"] = (
@@ -237,7 +360,7 @@ def clef_questions(mode="auto", sol_cap=None, bounds=None):
     ), "criteria": criteria}, "lease": QUESTIONS["lease"]}
 
 
-def execution_decision(decision, provider, mode="auto", sol_cap=None, bounds=None):
+def execution_decision(decision, provider, mode="auto", sol_cap=None, bounds=None, executor=None):
     """Clef's explicit user ceiling applies to old leases and old policy answers too."""
     if provider == "clef":
         decision = {**decision}
@@ -245,37 +368,41 @@ def execution_decision(decision, provider, mode="auto", sol_cap=None, bounds=Non
             decision.update(model=SOL, requested_model=ASTRA, gate="clef_sol_ceiling")
         before_model = decision["model"]
         decision["model"], decision["effort"] = clef_route(
-            decision["model"], decision["effort"], mode, sol_cap, bounds)
+            decision["model"], decision["effort"], mode, sol_cap, bounds, executor)
         if decision["model"] != before_model:
             decision.setdefault("requested_model", before_model)
             decision["gate"] = "clef_effort_bounds"
     return decision
 
 
-def provider_decision(answers, provider, mode="auto", sol_cap=None, bounds=None):
+def provider_decision(answers, provider, mode="auto", sol_cap=None, bounds=None, executor=None, local_eligible=True):
     if provider == "clef" and isinstance(answers, dict):
         bounds = clef_bounds(bounds)
         if "route" in answers:
-            choices = clef_questions(mode, sol_cap, bounds)["route"]["criteria"]
+            choices = clef_questions(mode, sol_cap, bounds, executor, local_eligible)["route"]["criteria"]
             choice, probabilities, confidence = _validated_choice(answers, "route", choices)
             name, effort = choice.split("_", 1)
             decision = decision_from_answers({
                 "astra_policy": {"choice": "normal"},
-                "model": {"choice": name, "confidence": confidence},
+                "model": {"choice": "sol" if name == "local" else name, "confidence": confidence},
                 "effort": {"choice": effort, "confidence": confidence},
                 "lease": answers.get("lease"),
             })
+            if name == "local":
+                decision.update(model=executor["model"], base_model=executor["model"])
             decision["probabilities"]["route"] = probabilities
             if probabilities is not None:
                 decision["probabilities"]["model"] = {
                     tier: sum(value for key, value in probabilities.items() if key.startswith(tier + "_"))
-                    for tier in ("luna", "sol", "astra")}
+                    for tier in (("local", "sol") if mode == "auto-local" else ("luna", "sol", "astra"))}
                 decision["probabilities"]["effort"] = {
                     depth: sum(value for key, value in probabilities.items() if key.endswith("_" + depth))
                     for depth in EFFORTS}
                 lease_probability = decision["chosen_probability"]
                 decision["chosen_probability"] = min(probabilities[choice], lease_probability) if lease_probability is not None else probabilities[choice]
-            return execution_decision(decision, provider, mode, sol_cap, bounds)
+            return execution_decision(decision, provider, mode, sol_cap, bounds, executor)
+        if mode == "auto-local":
+            raise ValueError("Auto (Clef Local) requires a joint local/Sol route decision")
         # Compatibility for historical independent decisions and old leases.
         answers = {**answers}
         answers.setdefault("astra_policy", {"choice": "normal"})
@@ -289,7 +416,7 @@ def provider_decision(answers, provider, mode="auto", sol_cap=None, bounds=None)
             probabilities = effort["probabilities"]
             if set(probabilities) == set(CLEF_MODES[mode]["efforts"]):
                 answers["effort"] = {**effort, "probabilities": {key: probabilities.get(key, 0) for key in EFFORTS}}
-    return execution_decision(decision_from_answers(answers), provider, mode, sol_cap, bounds)
+    return execution_decision(decision_from_answers(answers), provider, mode, sol_cap, bounds, executor)
 
 
 def decision_config(default_timeout=4.0):
@@ -332,6 +459,17 @@ def decision_config(default_timeout=4.0):
               "timeout": timeout, "baseline": baseline}
     if provider == "clef":
         config["effort_bounds"] = clef_bounds()
+        try:
+            config["local_executor"] = load_executor(
+                os.environ.get("CLEF_LOCAL_EXECUTOR_FILE") or os.path.join(STATE, "clef-local-executor.json"))
+        except (ValueError, OSError):
+            # Optional local configuration cannot disable the native profile.
+            config["local_executor"] = None
+            config["local_executor_error"] = "invalid local executor configuration"
+        if config["local_executor"]:
+            transport = {}
+            config["local_executor_error"] = local_transport_error(config["local_executor"], endpoint, transport)
+            config["local_executor_transport"] = transport
     return config
 
 
@@ -369,7 +507,13 @@ def decision_health():
                 "decision_configured": bool(load_decision_key(config)),
                 "decision_timeout": config["timeout"], "baseline_model": config["baseline"],
                 "allowed_execution_models": list(CLEF_MODELS if config["provider"] == "clef" else TIERS),
-                **({"auto_modes": CLEF_MODES, "effort_policy": CLEF_EFFORT_POLICY,
+                **({"auto_modes": (CLEF_ALL_MODES if config.get("local_executor")
+                                   and not config.get("local_executor_error") else CLEF_MODES),
+                    "local_executor": config.get("local_executor"),
+                    "local_executor_configured": bool(config.get("local_executor")) and not config.get("local_executor_error"),
+                    "local_executor_error": config.get("local_executor_error"),
+                    "local_execution_models": ([config["local_executor"]["model"], SOL]
+                                               if config.get("local_executor") else []), "effort_policy": CLEF_EFFORT_POLICY,
                     "effort_bounds": config["effort_bounds"],
                     "luna_efforts": allowed_efforts(LUNA, config["effort_bounds"]), "sol_effort_caps": list(EFFORTS),
                     "default_sol_effort_cap": CLEF_DEFAULT_CAPS["auto"],
@@ -1339,7 +1483,7 @@ def _cached_updates(scope, model, signature, ttl):
         return tuple(evidence.get("updates") or ())
 
 
-def cache_affinity(scope, payload, now=None, signature=None):
+def cache_affinity(scope, payload, now=None, signature=None, permitted_models=None, transport_identity=None):
     """Bounded measured cache evidence for one prompt-cache scope.
 
     Only a real prompt_cache_key is safe for continuity. The task-derived scope
@@ -1350,6 +1494,7 @@ def cache_affinity(scope, payload, now=None, signature=None):
         return None
     now = time.time() if now is None else now
     ttl = _cache_ttl_seconds(payload)
+    permitted_models = tuple(TIERS) if permitted_models is None else tuple(permitted_models)
     if signature is None:
         signature = _cache_signature(payload)
     with _cache_affinity_lock:
@@ -1358,20 +1503,17 @@ def cache_affinity(scope, payload, now=None, signature=None):
             return None
         models = {}
         for model, evidence in entry.get("models", {}).items():
-            if model not in TIERS or not isinstance(evidence, dict):
+            if model not in permitted_models or not isinstance(evidence, dict):
                 continue
             seen_at = evidence.get("seen_at")
             if not isinstance(seen_at, (int, float)) or now - seen_at > ttl:
                 continue
             models[model] = evidence
         if not models:
-            _cache_affinity.pop(scope, None)
             return None
-        entry["models"] = models
         last_model = entry.get("last_model")
         if last_model not in models:
             last_model = max(models, key=lambda model: models[model]["seen_at"])
-            entry["last_model"] = last_model
         result = {
             "last_model": route_label(last_model)[0],
             "context_k": (
@@ -1380,11 +1522,13 @@ def cache_affinity(scope, payload, now=None, signature=None):
             ),
             "models": {},
         }
-        for model in TIERS:
+        for model in permitted_models:
             evidence = models.get(model)
             if not evidence:
                 continue
             prefix = _cache_prefix_status(evidence.get("signature"), signature)
+            if model not in TIERS and evidence.get("transport_identity") != transport_identity:
+                prefix = "header_changed"
             compatible = prefix == "matched"
             result["models"][route_label(model)[0]] = {
                 "state": (evidence.get("state", "unknown") if compatible else
@@ -1396,17 +1540,19 @@ def cache_affinity(scope, payload, now=None, signature=None):
                            else None),
                 "age_s": max(0, int(now - evidence["seen_at"])),
                 "effort": evidence.get("effort"),
+                **({"reuse_requires_effort": evidence.get("effort")} if model not in TIERS else {}),
             }
         return result
 
 
 def remember_cache_model(scope, payload, model, status, usage=None, effort=None,
-                         now=None, signature=None, updates=()):
-    """Remember measured native cache evidence; HTTP success alone is not a hit."""
+                         now=None, signature=None, updates=(), permitted_models=None, transport_identity=None):
+    """Remember measured per-model cache evidence; HTTP success alone is not a hit."""
     raw_key = payload.get("prompt_cache_key")
+    permitted_models = tuple(TIERS) if permitted_models is None else tuple(permitted_models)
     if (
         status != 200
-        or model not in TIERS
+        or model not in permitted_models
         or not isinstance(raw_key, str)
         or not raw_key.strip()
     ):
@@ -1428,7 +1574,7 @@ def remember_cache_model(scope, payload, model, status, usage=None, effort=None,
         entry["models"] = {
             known_model: evidence
             for known_model, evidence in entry.get("models", {}).items()
-            if known_model in TIERS and isinstance(evidence, dict)
+            if isinstance(evidence, dict)
             and isinstance(evidence.get("seen_at"), (int, float))
             and now - evidence["seen_at"] <= ttl
         }
@@ -1444,8 +1590,12 @@ def remember_cache_model(scope, payload, model, status, usage=None, effort=None,
             "effort": effort if effort in EFFORTS else None,
             "signature": signature,
             "updates": tuple(updates),
+            "transport_identity": transport_identity if model not in TIERS else None,
         }
         entry["last_model"] = model
+        if len(entry["models"]) > 16:
+            oldest_model = min(entry["models"], key=lambda key: entry["models"][key]["seen_at"])
+            entry["models"].pop(oldest_model, None)
         if len(_cache_affinity) > 256:
             oldest = min(_cache_affinity, key=lambda key: max(
                 (value.get("seen_at", 0) for value in
@@ -1498,6 +1648,10 @@ def _lease_contract_fingerprint(payload):
         contract["sol_effort_cap"] = payload["_router_sol_effort_cap"]
     if "_router_effort_bounds" in payload:
         contract["effort_bounds"] = payload["_router_effort_bounds"]
+    if "_router_local_executor" in payload:
+        contract["local_executor"] = payload["_router_local_executor"]
+        contract["local_transport"] = payload.get("_router_local_transport")
+        contract["local_eligible"] = payload.get("_router_local_eligible", True)
     try:
         encoded = json.dumps(
             contract, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -2421,8 +2575,10 @@ class Handler(BaseHTTPRequestHandler):
                     "object": "model",
                     "created": 1758000000,
                     "owned_by": provider,
-                    "name": "Auto (Clef)" if provider == "clef" else DISPLAY_NAME,
-                } for model_id in ("auto",)],
+                    "name": ("Auto (Clef Local)" if model_id == "auto-local" else
+                             "Auto (Clef)" if provider == "clef" else DISPLAY_NAME),
+                } for model_id in (("auto", "auto-local") if provider == "clef"
+                                  and config.get("local_executor_configured") else ("auto",))],
             })
         elif path in ("/health", ""):
             config = decision_health()
@@ -2471,8 +2627,11 @@ class Handler(BaseHTTPRequestHandler):
         provider = config["provider"]
         baseline = config["baseline"]
         mode = payload.get("model", "auto") if provider == "clef" else None
-        if provider == "clef" and mode not in CLEF_MODES:
+        if provider == "clef" and mode not in CLEF_ALL_MODES:
             return self._json(400, {"error": {"message": "unsupported Clef Auto mode"}})
+        if mode == "auto-local" and (not config.get("local_executor") or config.get("local_executor_error")):
+            return self._json(400, {"error": {"message": config.get("local_executor_error") or
+                "Auto (Clef Local) requires a valid local executor; configure local-executor first"}})
         if provider == "clef":
             try:
                 clef_sol_cap(payload, mode)
@@ -2508,8 +2667,15 @@ class Handler(BaseHTTPRequestHandler):
         mode = payload.get("model", "auto") if provider == "clef" else None
         sol_cap = clef_sol_cap(payload, mode) if mode is not None else None
         bounds = config.get("effort_bounds") if mode is not None else None
+        executor = config.get("local_executor") if mode == "auto-local" else None
+        self._local_executor_model = executor["model"] if executor else None
+        permitted_models = (executor["model"], SOL) if executor else tuple(TIERS)
+        local_error = local_replay_error(payload, executor) if executor else None
+        local_eligible = local_error is None
+        if local_error and not allowed_efforts(SOL, bounds, sol_cap):
+            return self._json(400, {"error": {"message": local_error + "; no permitted Sol effort is available"}})
         if mode is not None:
-            baseline, _ = clef_route(baseline, None, mode, sol_cap, bounds)
+            baseline, _ = clef_route(baseline, None, mode, sol_cap, bounds, executor)
         # Our own answer signatures never travel back upstream (see
         # strip_signatures): the model must not read its own route tag.
         stripped = strip_signatures(payload)
@@ -2536,7 +2702,9 @@ class Handler(BaseHTTPRequestHandler):
         scope = cache_scope(payload, task)
         lease_scope = f"{scope}:clef:{mode}" if mode is not None else scope
         lease_payload = ({**payload, "_router_lease_mode": mode, "_router_sol_effort_cap": sol_cap,
-                          "_router_effort_bounds": bounds}
+                          "_router_effort_bounds": bounds, "_router_local_executor": executor,
+                          "_router_local_eligible": local_eligible,
+                          "_router_local_transport": config.get("local_executor_transport") if executor else None}
                          if mode is not None else payload)
         feedback, feedback_scope = self._feedback, self._feedback_scope
         verification = feedback.observe(feedback_scope, payload) if feedback is not None else None
@@ -2551,21 +2719,22 @@ class Handler(BaseHTTPRequestHandler):
         if verification is not None:
             # A new check outcome changes the decision even on a clean tool chain.
             with _route_lease_lock:
-                for profile in CLEF_MODES:
+                for profile in CLEF_ALL_MODES:
                     _route_leases.pop(f"{scope}:clef:{profile}", None)
         adaptive_context = feedback.context(feedback_scope) if feedback is not None else None
-        affinity = cache_affinity(scope, payload, signature=canonical_signature)
+        affinity = cache_affinity(scope, payload, signature=canonical_signature, permitted_models=permitted_models,
+                                  transport_identity=config.get("local_executor_transport") if executor else None)
         leased = route_lease(lease_scope, lease_payload, step)
         if os.path.exists(OFF_PATH):
             model, effort, speed, gate = baseline, None, "default", "off"
         else:
             key = load_decision_key(config)
             if leased is not None:
-                decision = execution_decision(leased, provider, mode, sol_cap, bounds)
+                decision = execution_decision(leased, provider, mode, sol_cap, bounds, executor)
                 tier, depth, conf = (
                     decision["model"], decision["effort"], decision["confidence"]
                 )
-                model, effort, speed, _ = route(tier, depth)
+                model, effort, speed, _ = (tier, depth, "default", "apply") if executor else route(tier, depth)
                 gate = decision["gate"]
                 decision_source = "lease"
             elif key and (task or step.get("digest") or signals.get("has_image")):
@@ -2573,19 +2742,22 @@ class Handler(BaseHTTPRequestHandler):
                 state = jev_state(task, prev_assistant, signals, step, affinity)
                 if mode is not None:
                     state["effort_policy"] = {
-                        "mode": mode, "preference": CLEF_MODES[mode]["preference"],
+                        "mode": mode, "preference": CLEF_ALL_MODES[mode]["preference"],
                         "sol_effort_cap": sol_cap, "effort_bounds": bounds,
-                        "luna_efforts": allowed_efforts(LUNA, bounds),
+                        "luna_efforts": [] if executor else allowed_efforts(LUNA, bounds),
+                        "local_executor": executor, "local_eligible": local_eligible,
+                        "local_unavailable_reason": local_error,
+                        "context_k": _estimated_context_k(payload),
                         "feedback": adaptive_context,
                     }
                 failure_evidence = route_failure_evidence(scope, payload)
                 if failure_evidence:
                     state["recent_route_failure"] = failure_evidence
                 try:
-                    result = (call_jev_routed(key, state, clef_questions(mode, sol_cap, bounds), config=config)
+                    result = (call_jev_routed(key, state, clef_questions(mode, sol_cap, bounds, executor, local_eligible), config=config)
                               if mode is not None else call_jev_routed(key, state))
                     decision_cache = result.get("decision_cache") if mode is not None else None
-                    decision = provider_decision(result.get("answers"), provider, mode, sol_cap, bounds)
+                    decision = provider_decision(result.get("answers"), provider, mode, sol_cap, bounds, executor, local_eligible)
                     raw_usage = result.get("usage") or {}
                     if not isinstance(raw_usage, dict):
                         raw_usage = {}
@@ -2594,7 +2766,7 @@ class Handler(BaseHTTPRequestHandler):
                                  and isinstance(v, int) and not isinstance(v, bool) and v >= 0}
                     tier, depth, conf = (decision["model"], decision["effort"],
                                          decision["confidence"])
-                    model, effort, speed, _ = route(tier, depth)
+                    model, effort, speed, _ = (tier, depth, "default", "apply") if executor else route(tier, depth)
                     gate = decision["gate"]
                     decision_source = provider
                 except Exception as exc:
@@ -2606,17 +2778,17 @@ class Handler(BaseHTTPRequestHandler):
                 decision_source = "technical_fallback"
 
         if mode is not None:
-            model, effort = clef_route(model, effort or (payload.get("reasoning") or {}).get("effort"), mode, sol_cap, bounds)
+            model, effort = clef_route(model, effort or (payload.get("reasoning") or {}).get("effort"), mode, sol_cap, bounds, executor)
 
         shadow_enabled = os.path.exists(SHADOW_PATH)
 
         would = None
         if shadow_enabled:
             would = {"model": model, "effort": effort, "speed": speed, "gate": gate}
-            label = {LUNA: "luna", SOL: "sol", ASTRA: "astra"}[baseline]
+            label = route_label(baseline)[0]
             model, effort, speed, gate = baseline, None, "default", f"shadow({label})"
             if mode is not None:
-                model, effort = clef_route(model, (payload.get("reasoning") or {}).get("effort"), mode, sol_cap, bounds)
+                model, effort = clef_route(model, (payload.get("reasoning") or {}).get("effort"), mode, sol_cap, bounds, executor)
 
         # ONLY while native usage is exhausted (manual flag or observed quota
         # failure), replace the OpenAI ladder with locally discovered configured
@@ -2627,6 +2799,10 @@ class Handler(BaseHTTPRequestHandler):
         no_fallback = False
 
         def permitted_fallbacks():
+            if executor:
+                # One configured local route is an explicit alternative to exhausted Sol.
+                return [executor["model"]] if local_eligible and executor["model"] not in {
+                    attempt.get("model") for attempt in self._attempts} else []
             candidates = fallback_candidates(native_model, payload)
             # An opaque configured alias could resolve to Astra. Clef's hard
             # user ceiling permits only the two explicit native model IDs.
@@ -2649,11 +2825,12 @@ class Handler(BaseHTTPRequestHandler):
         # Display the model actually serving the request, including shadow and
         # operational fallbacks, rather than a hypothetical classification.
         if mode is not None:
-            model, effort = clef_route(model, effort, mode, sol_cap, bounds)
+            model, effort = clef_route(model, effort, mode, sol_cap, bounds, executor)
         shown = {"model": model, "effort": effort or (payload.get("reasoning") or {}).get("effort")}
         marker = route_marker(shown["model"], shown["effort"])
         signature = presentation_signature(payload, shown)
 
+        original_transport = {key: payload[key] for key in ("include", "previous_response_id") if key in payload}
         original_reasoning = (
             dict(payload["reasoning"]) if isinstance(payload.get("reasoning"), dict) else None
         )
@@ -2662,18 +2839,31 @@ class Handler(BaseHTTPRequestHandler):
 
         def apply_route(model, effort):
             nonlocal applied_updates, effort_transport
-            if provider == "clef" and model not in CLEF_MODELS:
+            for key in ("include", "previous_response_id"):
+                if key in original_transport:
+                    payload[key] = original_transport[key]
+                else:
+                    payload.pop(key, None)
+            if provider == "clef" and model not in ((executor["model"], SOL) if executor else CLEF_MODELS):
                 raise ValueError("Clef execution is restricted to Luna or Sol")
             reasoning = original_reasoning
             cached_updates = _cached_updates(scope, model, canonical_signature, _cache_ttl_seconds(payload))
             if mode is not None:
-                model, effort = clef_route(model, effort, mode, sol_cap, bounds)
+                model, effort = clef_route(model, effort, mode, sol_cap, bounds, executor)
                 reasoning = dict(original_reasoning or {})
                 reasoning["effort"] = clef_effort(mode, reasoning.get("effort") or effort, model, sol_cap, bounds)
                 cached_updates = tuple((index, clef_effort(mode, previous, model, sol_cap, bounds)) for index, previous in cached_updates)
             applied_updates, effort_transport = apply_route_payload(
                 payload, model, effort, reasoning, canonical_items, cached_updates,
             )
+            if executor and model == executor["model"]:
+                # Generic adapters translate portable message/tool history. Native
+                # control updates and encrypted reasoning are not local context.
+                if isinstance(payload.get("input"), list):
+                    payload["input"] = [item for item in payload["input"]
+                                        if not isinstance(item, dict) or item.get("type") != "configuration_update"]
+                payload.pop("previous_response_id", None)
+                payload.pop("include", None)
             if provider == "clef" and isinstance(payload.get("input"), list):
                 # Inline caller updates must not override this attempt's model.
                 # Retain historical reasoning and other transport settings.
@@ -2725,7 +2915,7 @@ class Handler(BaseHTTPRequestHandler):
                 exact_route=provider == "clef" or bool(dry_reason and model not in TIERS))
         retried = False
         fallback = None
-        if quota_hit and not dry_reason:
+        if quota_hit and model in TIERS and not dry_reason:
             # Native usage is exhausted: discover fallback routes now, then
             # retry this exact canonical call before anything reaches the client.
             mark_native_dry("quota", resets_at=resets_at)
@@ -2761,6 +2951,19 @@ class Handler(BaseHTTPRequestHandler):
             status, out_kind, ctype, quota_hit, unwritten, _resets_at = self._forward(
                 payload, out_path, stream_requested, debug, marker, model, signature, effort,
                 exact_route=True)
+        if (executor and model == executor["model"] and len(self._attempts) == 1
+                and status >= 400 and unwritten is not None and not self._response_started
+                and allowed_efforts(SOL, bounds, sol_cap) and not native_dry()):
+            # Local outage/empty output: a single bounded Sol attempt before bytes escape.
+            model, effort = clef_route(SOL, "medium", mode, sol_cap, bounds, executor)
+            model, effort = apply_route(model, effort)
+            marker = route_marker(model, effort)
+            signature = presentation_signature(payload, {"model": model, "effort": effort})
+            retried = True
+            gate = "local_executor_retry"
+            status, out_kind, ctype, quota_hit, unwritten, _resets_at = self._forward(
+                payload, out_path, stream_requested, debug, marker, model, signature, effort,
+                exact_route=True)
         if (not dry_reason and model in TIERS and len(self._attempts) == 1
                 and status == 502 and unwritten is not None
                 and self._attempts[-1].get("completion") == "empty_completion"):
@@ -2768,7 +2971,7 @@ class Handler(BaseHTTPRequestHandler):
             # Do not re-enter native service after a quota/provider fallback.
             recovery_model, recovery_effort = (SOL if provider == "clef" else ASTRA), "medium"
             if mode is not None:
-                recovery_model, recovery_effort = clef_route(recovery_model, recovery_effort, mode, sol_cap, bounds)
+                recovery_model, recovery_effort = clef_route(recovery_model, recovery_effort, mode, sol_cap, bounds, executor)
             if (model, effort) != (recovery_model, recovery_effort):
                 model, effort = recovery_model, recovery_effort
                 model, effort = apply_route(model, effort)
@@ -2809,8 +3012,9 @@ class Handler(BaseHTTPRequestHandler):
             scope, payload, model, completed_status,
             usage=final_attempt.get("usage") if final_attempt else None,
             effort=effort,
-            signature=(canonical_signature if applied_updates else None),
-            updates=applied_updates,
+            signature=(canonical_signature if applied_updates or executor else None),
+            updates=applied_updates, permitted_models=permitted_models,
+            transport_identity=config.get("local_executor_transport") if executor else None,
         )
         # A recovery validates the serving model, never the failed original route.
         lease_decision = decision if (
@@ -2837,6 +3041,9 @@ class Handler(BaseHTTPRequestHandler):
             "effort_policy": CLEF_EFFORT_POLICY if mode is not None else None,
             "sol_effort_cap": sol_cap,
             "effort_bounds": bounds,
+            "local_executor": executor["model"] if executor else None,
+            "local_eligible": local_eligible if executor else None,
+            "local_unavailable_reason": local_error,
             "verification": verification,
             "tool_output_preview": output_preview,
             "lease": decision.get("lease") if decision else None,
@@ -2985,8 +3192,11 @@ class Handler(BaseHTTPRequestHandler):
                         piece = markerer.feed(chunk).encode("utf-8")
                         if piece:
                             pending.extend(piece)
+                        local_failed = (model == getattr(self, "_local_executor_model", None)
+                                        and markerer.terminal_type == "response.failed"
+                                        and not markerer.exposed)
                         if markerer.exposed or (
-                            markerer.terminal_type and not markerer.empty_completion
+                            markerer.terminal_type and not markerer.empty_completion and not local_failed
                         ):
                             connected = write_piece(bytes(pending))
                             pending.clear()
@@ -3011,6 +3221,12 @@ class Handler(BaseHTTPRequestHandler):
                     markerer.terminal_source = "local_empty_completion"
                     markerer.terminal_error_code = "empty_completion"
                     data = b'{"error":{"code":"empty_completion","message":"model completed without output"}}'
+                    return status, "json", "application/json", False, data, None
+                if (model == getattr(self, "_local_executor_model", None)
+                        and markerer.terminal_type == "response.failed" and not stream_started):
+                    status = 502
+                    attempt["completion"] = "response.failed"
+                    data = b'{"error":{"message":"local executor failed before output"}}'
                     return status, "json", "application/json", False, data, None
                 if markerer.terminal_type:
                     write_piece(bytes(pending))

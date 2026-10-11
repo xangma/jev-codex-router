@@ -15,9 +15,15 @@ import sys
 import time
 import urllib.request
 
+from local_executor import load_executor
+
 REPO = Path(__file__).resolve().parent.parent
 LABEL = "com.xangma.clef-flash"
 PICKER_MODELS = ("jev/auto",)
+
+
+def picker_models():
+    return (*PICKER_MODELS, *(("jev/auto-local",) if load_executor() else ()))
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -267,14 +273,15 @@ def main():
     run(cli, "chatgpt-session", "enable")
     run(REPO / "router/install.sh", "--auto", "--providers", "configured", "--no-tray")
     run(cli, "refresh-catalog")
-    for picker_model in PICKER_MODELS:
+    models = picker_models()
+    for picker_model in models:
         run(REPO / "router/bin/control", "picker", "set", picker_model, "show")
     env["JEV_PYTHON"] = sys.executable
     run("/bin/zsh", REPO / "server/install-service.sh")
     verify_clef_adapter()
     if args.smoke:
         run(sys.executable, REPO / "server/smoke.py")
-    print(json.dumps({"installed": "clef", "model": "jev/auto", "models": list(PICKER_MODELS),
+    print(json.dumps({"installed": "clef", "model": "jev/auto", "models": list(models),
                       "display": "Auto (Clef)", "models_preset": str(preset_file),
                       "sleep_idle_seconds": args.sleep_idle_seconds,
                       "next": "Restart Codex when convenient, then select Auto (Clef). Effort sets the maximum Sol effort; use effort-policy to set model floors and ceilings."}))

@@ -4,6 +4,8 @@ import {
   readUserModels,
   writeUserModels,
 } from "../router/src/user-models.mjs";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const isClef = process.env.JEV_DECISION_PROVIDER === "clef";
 export const JEV_MODEL = Object.freeze({
@@ -34,7 +36,35 @@ export const JEV_MODEL = Object.freeze({
   inputModalities: ["text", "image"],
 });
 
-export const AUTO_MODELS = Object.freeze([JEV_MODEL]);
+const localExecutor = isClef ? JSON.parse(execFileSync(
+  process.env.JEV_PYTHON || process.env.PYTHON || "python3",
+  [fileURLToPath(new URL("./local_executor.py", import.meta.url)), "show"],
+  { encoding: "utf8", maxBuffer: 32768 },
+)).executor : null;
+
+export const LOCAL_AUTO_MODEL = localExecutor ? Object.freeze({
+  ...JEV_MODEL,
+  slug: "jev/auto-local",
+  gatewayModel: "jev-auto-local",
+  compHash: "jev-auto-local-user-v1",
+  upstreamModel: "auto-local",
+  displayName: "Auto (Clef Local)",
+  description: "Clef chooses your configured local executor or GPT-6.1 Sol. The effort selector sets the maximum Sol effort.",
+  priority: 94,
+  reasoningLevels: JEV_MODEL.reasoningLevels.map(({ effort }) => ({
+    effort,
+    description: `Maximum Sol effort: ${effort}. Local execution follows its configured efforts.`,
+  })),
+  contextWindow: Math.min(JEV_MODEL.contextWindow, localExecutor.context_window),
+  autoCompact: Math.floor(Math.min(JEV_MODEL.contextWindow, localExecutor.context_window) * 0.85),
+  // Hosted search is attached to ordinary Codex requests when advertised,
+  // making a local executor ineligible even for simple coding turns.
+  searchTool: undefined,
+  supportsSearchHistory: false,
+  inputModalities: ["text"],
+}) : null;
+
+export const AUTO_MODELS = Object.freeze([JEV_MODEL, ...(LOCAL_AUTO_MODEL ? [LOCAL_AUTO_MODEL] : [])]);
 // Keep old conversation routes usable without offering duplicate picker modes.
 export const LEGACY_AUTO_MODELS = Object.freeze(isClef ? [
   {
@@ -52,7 +82,7 @@ export const LEGACY_AUTO_MODELS = Object.freeze(isClef ? [
 ] : []);
 
 const existing = readUserModels();
-const managedSlugs = new Set(["jev/auto-cheap", "jev/auto", "jev/auto-deep"]);
+const managedSlugs = new Set(["jev/auto-cheap", "jev/auto", "jev/auto-deep", "jev/auto-local"]);
 const next = [
   ...existing.filter((model) => !managedSlugs.has(model?.slug)),
   ...AUTO_MODELS,

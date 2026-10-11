@@ -15,7 +15,7 @@ from routing_policy import EFFORTS, POLICY_VERSION, SOL, TIERS
 
 def main():
     parser = argparse.ArgumentParser(description="Verify a live Auto route")
-    parser.add_argument("--model", choices=("jev/auto", "jev/auto-cheap", "jev/auto-deep"), default="jev/auto")
+    parser.add_argument("--model", choices=("jev/auto", "jev/auto-local", "jev/auto-cheap", "jev/auto-deep"), default="jev/auto")
     parser.add_argument("--expect-effort", choices=EFFORTS,
                         help="Require an exact effort for this trivial live request")
     parser.add_argument("--sol-effort-cap", choices=EFFORTS,
@@ -89,11 +89,14 @@ def main():
             or route.get("completion_status") != "response.completed"
         ):
             raise RuntimeError("the request completed without a verified decision; check the provider and route")
-        if route.get("model") not in TIERS or route.get("effort") not in EFFORTS:
+        local_mode = mode == "auto-local"
+        permitted = (health_data.get("local_execution_models", []) if local_mode
+                     else health_data.get("allowed_execution_models", list(TIERS)))
+        if route.get("model") not in permitted or route.get("effort") not in EFFORTS:
             raise RuntimeError("the Jev decision did not report a supported model and effort")
         if decision_provider == "clef" and (
-            route.get("model") not in health_data.get("allowed_execution_models", [])
-            or any(attempt.get("model") not in health_data.get("allowed_execution_models", [])
+            route.get("model") not in permitted
+            or any(attempt.get("model") not in permitted
                    for attempt in route.get("attempts", []))
         ):
             raise RuntimeError("Clef attempted a model outside its execution ceiling")
@@ -109,12 +112,18 @@ def main():
                 raise RuntimeError("The live route did not apply the configured effort bounds")
             for attempt in [route, *route.get("attempts", [])]:
                 effort = attempt.get("effort")
-                if effort not in allowed_efforts(attempt.get("model"), bounds, sol_cap):
+                executor = health_data.get("local_executor") or {}
+                eligible = (executor.get("efforts", []) if local_mode
+                            and attempt.get("model") == executor.get("model")
+                            else allowed_efforts(attempt.get("model"), bounds, sol_cap))
+                if effort not in eligible:
                     raise RuntimeError("Clef attempted reasoning outside its configured bounds")
         if args.expect_effort and route.get("effort") != args.expect_effort:
             raise RuntimeError("The live route did not select the expected reasoning effort")
-        if response_model != route["model"]:
+        if route["model"] in TIERS and response_model != route["model"]:
             raise RuntimeError("the upstream response model did not match the Jev route")
+        if route["model"] not in TIERS and not response_model:
+            raise RuntimeError("the local response did not report its upstream model")
         expected_label = f"{route['model']} · reasoning: {route['effort']}"
         if expected_label not in "".join(output_text)[:240]:
             raise RuntimeError("the streamed assistant text did not show its routed model and effort")

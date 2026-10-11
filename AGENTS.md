@@ -23,7 +23,10 @@ effort-policy show|set|reset` to manage floors and ceilings without a restart.
 Clef jointly selects a permitted model/effort pair. Bounds apply to leases,
 inline updates and operational fallbacks. Astra is excluded from every Clef execution path.
 Hidden `auto-cheap`/`auto-deep` aliases preserve old chats with low/high default
-Sol ceilings. Verify with `JEV_DECISION_PROVIDER=clef python3 server/smoke.py
+Sol ceilings. An optional **Auto (Clef Local)** route (`jev/auto-local`) chooses
+a separately configured open-weight executor or Sol; follow [LOCAL-AUTO.md](LOCAL-AUTO.md).
+Never add that executor to Clef's one-model server. Endpoints and paths belong
+in local state, never repository defaults. Verify with `JEV_DECISION_PROVIDER=clef python3 server/smoke.py
 --sol-effort-cap high`; `/health` must report `effort_policy=effort-bounds-v1`.
 
 ## Hard rules (never violate)

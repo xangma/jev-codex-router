@@ -9,6 +9,9 @@ import json
 import urllib.request
 import configparser
 import argparse
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 spec = importlib.util.spec_from_file_location("clef_install", Path(__file__).with_name("install-clef.py"))
 installer = importlib.util.module_from_spec(spec)
@@ -51,6 +54,12 @@ class ClefCredentialFiles(unittest.TestCase):
 
 
 class ClefInstallTransport(unittest.TestCase):
+    def test_local_picker_only_published_when_executor_configured(self):
+        with patch.object(installer, "load_executor", return_value=None):
+            self.assertEqual(installer.picker_models(), ("jev/auto",))
+        with patch.object(installer, "load_executor", return_value={"model": "my-llama/qwen"}):
+            self.assertEqual(installer.picker_models(), ("jev/auto", "jev/auto-local"))
+
     def test_redirect_cannot_forward_authorization(self):
         request = urllib.request.Request("http://127.0.0.1:8082/v1/models",
                                          headers={"Authorization": "Bearer private-fixture"})
