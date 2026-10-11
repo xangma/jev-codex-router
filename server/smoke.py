@@ -72,7 +72,9 @@ def main():
                 if isinstance(delta, str):
                     output_text.append(delta)
             if event.get("type") == "response.completed":
-                result["status"] = (event.get("response") or {}).get("status")
+                completed = event.get("response") or {}
+                result["status"] = completed.get("status")
+                response_model = completed.get("model") or response_model
         if result["status"] != "completed":
             raise RuntimeError("no successful terminal response")
         route = None

@@ -34,8 +34,9 @@ JEV_DECISION_PROVIDER=clef node server/configure-model.mjs
 bin/jev-codex-router router refresh-catalog
 ```
 
-Skip the credential command for an anonymous server. Use `openai-responses`
-instead if your server implements the Responses protocol directly. Use HTTPS
+Skip the credential command for an anonymous server. Prefer `openai-responses`
+if your server implements the Responses protocol directly; this avoids a
+Chat Completions bridge and its tool-schema conversions. Use HTTPS
 for remote endpoints, or an existing trusted private network. Credentials stay
 in the router's protected provider store, separate from executor settings.
 No server, user path or credential is included in the repository.
