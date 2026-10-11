@@ -15,6 +15,15 @@ cheapest sufficient model at an adapted thinking depth. Local hops stay on
 loopback; Jev calls go to TypeSafe. Authenticated model requests are fail-open
 on Jev classification errors; there is a kill switch.
 
+For the local **Clef** profile (`JEV_DECISION_PROVIDER=clef`), follow [CLEF.md](CLEF.md).
+The picker publishes one **Auto (Clef)** route (`jev/auto`). The selected effort
+is the maximum GPT-6.1 Sol effort; GPT-6 Luna retains all five efforts. Clef jointly
+selects a permitted model/effort pair. Sol ceilings apply to leases, inline updates
+and operational fallbacks. Astra is excluded from every Clef execution path.
+Hidden `auto-cheap`/`auto-deep` aliases preserve old chats with low/high default
+Sol ceilings. Verify with `JEV_DECISION_PROVIDER=clef python3 server/smoke.py
+--sol-effort-cap high`; `/health` must report `effort_policy=sol-cap-v1`.
+
 ## Hard rules (never violate)
 
 1. **Never print, log, commit, or transmit secrets** — the TypeSafe API key,

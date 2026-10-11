@@ -22,6 +22,23 @@ def clef_env(key_file="/not/read/in/config", endpoint="http://127.0.0.1:8082/v1/
             "JEV_DECISION_TIMEOUT": "30", "JEV_BASELINE_MODEL": jev.SOL}
 
 
+def clef_answer(model, effort, lease="one_call"):
+    name = {jev.LUNA: "luna", jev.SOL: "sol"}[model]
+    return {"model": "clef-test", "answers": {
+        "route": {"choice": f"{name}_{effort}", "confidence": 0.3},
+        "lease": {"choice": lease, "confidence": 0.3}},
+        "usage": {"input_tokens": 100, "output_tokens": 5}}
+
+
+def effective_effort(payload):
+    effort = (payload.get("reasoning") or {}).get("effort")
+    for item in payload.get("input", []):
+        if (isinstance(item, dict) and item.get("type") == "configuration_update"
+                and isinstance(item.get("reasoning"), dict) and "effort" in item["reasoning"]):
+            effort = item["reasoning"]["effort"]
+    return effort
+
+
 class DecisionConfiguration(unittest.TestCase):
     def test_default_profile_preserves_jev_and_astra(self):
         with mock.patch.dict(os.environ, {}, clear=True), \
@@ -79,24 +96,53 @@ class DecisionConfiguration(unittest.TestCase):
         self.assertEqual(jev.provider_decision(old, "clef")["model"], jev.SOL)
         self.assertEqual(jev.provider_decision(old, "jev")["model"], jev.ASTRA)
 
-    def test_soft_profiles_preserve_every_model_effort_choice(self):
+    def test_joint_options_include_all_luna_efforts_and_only_sol_below_cap(self):
         for mode, profile in jev.CLEF_MODES.items():
-            for model in jev.CLEF_MODELS:
-                for effort in jev.EFFORTS:
-                    with self.subTest(mode=mode, model=model, effort=effort):
-                        answer = routing.answer(model, effort)["answers"]
-                        decision = jev.provider_decision(answer, "clef", mode)
-                        self.assertEqual(decision["model"], model)
-                        self.assertEqual(decision["effort"], effort)
-                        self.assertEqual(jev.provider_decision(answer, "jev")["effort"], effort)
-            answers = routing.answer(jev.LUNA, profile["efforts"][0])["answers"]
-            answers["effort"]["probabilities"] = {value: int(value == profile["efforts"][0])
-                                                 for value in profile["efforts"]}
-            self.assertEqual(jev.provider_decision(answers, "clef", mode)["model"], jev.LUNA)
-            self.assertEqual(set(jev.clef_questions(mode)["effort"]["criteria"]), set(profile["efforts"]))
-            self.assertEqual(set(profile["efforts"]), set(jev.EFFORTS))
-            self.assertIn(profile["preference"], jev.clef_questions(mode)["effort"]["instructions"])
+            for cap in jev.EFFORTS:
+                question = jev.clef_questions(mode, cap)["route"]
+                expected = {f"luna_{effort}" for effort in jev.EFFORTS} | {
+                    f"sol_{effort}" for effort in jev.EFFORTS[:jev.EFFORTS.index(cap) + 1]}
+                self.assertEqual(set(question["criteria"]), expected)
+                self.assertIn(profile["preference"], question["instructions"])
+                for model in jev.CLEF_MODELS:
+                    for effort in jev.EFFORTS:
+                        with self.subTest(mode=mode, cap=cap, model=model, effort=effort):
+                            answers = clef_answer(model, effort)["answers"]
+                            if model == jev.SOL and jev.EFFORTS.index(effort) > jev.EFFORTS.index(cap):
+                                with self.assertRaises(ValueError):
+                                    jev.provider_decision(answers, "clef", mode, cap)
+                            else:
+                                decision = jev.provider_decision(answers, "clef", mode, cap)
+                                self.assertEqual((decision["model"], decision["effort"]), (model, effort))
+                            legacy = routing.answer(model, effort)["answers"]
+                            self.assertEqual(jev.provider_decision(legacy, "jev")["effort"], effort)
         self.assertNotEqual(jev.clef_questions("auto-cheap"), jev.clef_questions("auto-deep"))
+
+    def test_joint_distribution_is_validated_without_marginal_argmax_assumptions(self):
+        answers = clef_answer(jev.LUNA, "low")["answers"]
+        choices = jev.clef_questions(sol_cap="medium")["route"]["criteria"]
+        probabilities = {choice: 0 for choice in choices}
+        probabilities.update(luna_low=0.4, sol_low=0.3, sol_medium=0.3)
+        answers["route"]["probabilities"] = probabilities
+        decision = jev.provider_decision(answers, "clef", sol_cap="medium")
+        self.assertEqual((decision["model"], decision["effort"]), (jev.LUNA, "low"))
+        self.assertEqual(decision["chosen_probability"], 0.4)
+        self.assertEqual(decision["probabilities"]["model"]["sol"], 0.6)
+        for invalid in ({**probabilities, "sol_max": 0}, {**probabilities, "luna_low": float("nan")},
+                        {**probabilities, "luna_low": 0.2, "sol_low": 0.5}):
+            answers["route"]["probabilities"] = invalid
+            with self.assertRaises(ValueError):
+                jev.provider_decision(answers, "clef", sol_cap="medium")
+
+    def test_picker_defaults_and_historical_routes_cap_only_sol(self):
+        for mode, default in jev.CLEF_DEFAULT_CAPS.items():
+            self.assertEqual(jev.clef_sol_cap({}, mode), default)
+            for cap in jev.EFFORTS:
+                self.assertEqual(jev.clef_sol_cap({"reasoning": {"effort": cap}}, mode), cap)
+                for model in (jev.LUNA, jev.SOL, jev.ASTRA):
+                    decision = jev.provider_decision(routing.answer(model, "max")["answers"], "clef", mode, cap)
+                    self.assertEqual(decision["model"], jev.LUNA if model == jev.LUNA else jev.SOL)
+                    self.assertEqual(decision["effort"], "max" if model == jev.LUNA else cap)
 
     def test_clef_key_is_explicit_protected_and_never_discovers_hosted_keys(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -206,7 +252,7 @@ class ClefRoutingWorkflow(unittest.TestCase):
             jev._route_leases.clear()
             jev._route_failures.clear()
         DecisionEndpoint.requests = []
-        DecisionEndpoint.answer = routing.answer(jev.LUNA, "low")
+        DecisionEndpoint.answer = clef_answer(jev.LUNA, "low")
         DecisionEndpoint.status = 200
         DecisionEndpoint.redirect = None
         routing.Edge.payloads = []
@@ -241,7 +287,6 @@ class ClefRoutingWorkflow(unittest.TestCase):
 
     def test_local_duplicate_decision_reuses_result_and_changed_state_is_fresh(self):
         self.enterContext(mock.patch.object(jev, "model_version", return_value=(1,)))
-        DecisionEndpoint.answer["answers"].pop("astra_policy")
         body = {"state": {"task": "Synthetic duplicate decision"}, "questions": jev.clef_questions()}
         first_status, first_raw = self.request(path="/ask", body=body)
         second_status, second_raw = self.request(path="/ask", body=body)
@@ -272,8 +317,9 @@ class ClefRoutingWorkflow(unittest.TestCase):
         self.assertEqual(headers["Authorization"], "Bearer local-fixture")
         self.assertEqual(body["model"], "clef-flash")
         self.assertEqual(body["questions"], jev.clef_questions("auto"))
-        self.assertEqual(set(body["questions"]), {"model", "effort", "lease"})
-        self.assertEqual(set(body["questions"]["model"]["criteria"]), {"luna", "sol"})
+        self.assertEqual(set(body["questions"]), {"route", "lease"})
+        self.assertEqual(set(body["questions"]["route"]["criteria"]), {
+            "luna_low", "luna_medium", "luna_high", "luna_xhigh", "luna_max", "sol_low", "sol_medium"})
         self.assertIn("task", body["state"])
         self.assertEqual((record["model"], record["effort"]), (jev.LUNA, "low"))
         self.assertEqual(record["decision_source"], "clef")
@@ -288,11 +334,188 @@ class ClefRoutingWorkflow(unittest.TestCase):
             answer["confidence"] = 0.01
         self.assertEqual(self.route()["model"], jev.LUNA)
 
+    def test_picker_high_is_sol_ceiling_not_a_luna_effort_override(self):
+        body = routing.payload_for([routing.message("user", "Continue this bounded task.")],
+                                   reasoning={"effort": "high"})
+        DecisionEndpoint.answer = routing.answer(jev.SOL, "max")
+        self.assertEqual(self.route(body)["effort"], "high")
+        DecisionEndpoint.answer = routing.answer(jev.LUNA, "low")
+        self.assertEqual(self.route(body)["effort"], "low")
+
+    def test_all_picker_caps_preserve_every_luna_effort_and_valid_sol_pair(self):
+        for cap in jev.EFFORTS:
+            for model in jev.CLEF_MODELS:
+                for effort in jev.EFFORTS:
+                    if model == jev.SOL and jev.EFFORTS.index(effort) > jev.EFFORTS.index(cap):
+                        continue
+                    with self.subTest(cap=cap, model=model, effort=effort):
+                        DecisionEndpoint.answer = clef_answer(model, effort)
+                        body = routing.payload_for([routing.message("user", "Continue this supplied task.")],
+                                                   reasoning={"effort": cap})
+                        record = self.route(body)
+                        sent = routing.Edge.payloads[-1]
+                        self.assertEqual((record["model"], record["effort"]), (model, effort))
+                        self.assertEqual(effective_effort(sent), effort)
+                        self.assertEqual(record["sol_effort_cap"], cap)
+                        state = DecisionEndpoint.requests[-1][2]["state"]["effort_policy"]
+                        self.assertEqual(state["sol_effort_cap"], cap)
+                        self.assertEqual(state["luna_efforts"], list(jev.EFFORTS))
+                        if model == jev.SOL:
+                            self.assertLessEqual(jev.EFFORTS.index(sent["reasoning"]["effort"]), jev.EFFORTS.index(cap))
+
+    def test_cap_change_invalidates_lease_but_keeps_model_cache_scope(self):
+        opening = [routing.message("user", "Continue this supplied task.")]
+        DecisionEndpoint.answer = clef_answer(jev.SOL, "high", lease="user_turn")
+        first = self.route(routing.payload_for(opening, reasoning={"effort": "high"}))
+        continuation = opening + [routing.tool_call("cap-call"), routing.tool_step("cap-call", "OK")]
+        leased = self.route(routing.payload_for(continuation, reasoning={"effort": "high"}))
+        self.assertEqual(leased["decision_source"], "lease")
+        self.assertEqual(effective_effort(routing.Edge.payloads[-1]), "high")
+        DecisionEndpoint.answer = clef_answer(jev.SOL, "low", lease="user_turn")
+        changed = self.route(routing.payload_for(continuation, reasoning={"effort": "low"}))
+        self.assertEqual(changed["decision_source"], "clef")
+        self.assertEqual(len(DecisionEndpoint.requests), 2)
+        self.assertEqual(changed["cache_scope"], first["cache_scope"])
+        self.assertEqual(effective_effort(routing.Edge.payloads[-1]), "low")
+        self.assertNotEqual(jev._lease_contract_fingerprint({"_router_sol_effort_cap": "low"}),
+                            jev._lease_contract_fingerprint({"_router_sol_effort_cap": "high"}))
+
+    def test_cached_configuration_update_replay_remains_capped_after_picker_change(self):
+        opening = [routing.message("user", "Complete this bounded task.")]
+        DecisionEndpoint.answer = clef_answer(jev.SOL, "high", lease="user_turn")
+        first = self.route(routing.payload_for(opening, reasoning={"effort": "max"}))
+        self.assertEqual(first["effort_transport"], "configuration_update")
+        self.assertEqual(effective_effort(routing.Edge.payloads[-1]), "high")
+        continuation = opening + [routing.tool_call("replay-cap"), routing.tool_step("replay-cap", "OK")]
+        replay = self.route(routing.payload_for(continuation, reasoning={"effort": "max"}))
+        self.assertEqual(replay["decision_source"], "lease")
+        self.assertEqual(replay["effort_transport"], "configuration_update_replay")
+        self.assertEqual(effective_effort(routing.Edge.payloads[-1]), "high")
+        DecisionEndpoint.answer = clef_answer(jev.SOL, "low", lease="user_turn")
+        changed = self.route(routing.payload_for(continuation, reasoning={"effort": "low"}))
+        self.assertEqual(changed["decision_source"], "clef")
+        self.assertEqual(changed["effort_transport"], "request")
+        self.assertEqual(effective_effort(routing.Edge.payloads[-1]), "low")
+        self.assertEqual(len(DecisionEndpoint.requests), 2)
+
+    def test_unoffered_sol_pair_is_technical_fallback_within_picker_cap(self):
+        DecisionEndpoint.answer = clef_answer(jev.SOL, "max")
+        body = routing.payload_for([routing.message("user", "Continue.")], reasoning={"effort": "low"})
+        record = self.route(body)
+        self.assertEqual(record["decision_source"], "technical_fallback")
+        self.assertEqual((record["model"], record["effort"]), (jev.SOL, "low"))
+        self.assertEqual(effective_effort(routing.Edge.payloads[-1]), "low")
+        self.assertNotIn("sol_max", DecisionEndpoint.requests[-1][2]["questions"]["route"]["criteria"])
+
+    def test_changed_cap_changes_decision_cache_dossier_and_question_inventory(self):
+        self.enterContext(mock.patch.object(jev, "model_version", return_value=(1,)))
+        for cap in ("low", "high"):
+            body = {"state": {"task": "Synthetic repeated task", "effort_policy": {"sol_effort_cap": cap}},
+                    "questions": jev.clef_questions(sol_cap=cap)}
+            self.assertEqual(self.request("/ask", body)[0], 200)
+            status, raw = self.request("/ask", body)
+            self.assertEqual(status, 200)
+            self.assertTrue(json.loads(raw)["decision_cache"]["hit"])
+        self.assertEqual(len(DecisionEndpoint.requests), 2)
+        self.assertNotEqual(DecisionEndpoint.requests[0][2]["questions"], DecisionEndpoint.requests[1][2]["questions"])
+
+    def test_sol_inline_updates_and_cached_transport_do_not_override_chosen_effort(self):
+        for cap in jev.EFFORTS:
+            with self.subTest(cap=cap):
+                DecisionEndpoint.answer = clef_answer(jev.SOL, "low")
+                reasoning_item = {"type": "reasoning", "encrypted_content": "synthetic-opaque-thinking"}
+                body = routing.payload_for([
+                    {"type": "configuration_update", "model": jev.ASTRA, "reasoning": {"effort": "max", "summary": "auto"}},
+                    routing.message("user", "Continue this task exactly."), reasoning_item,
+                    routing.tool_call("inline"), routing.tool_step("inline", "exact result"),
+                    {"type": "configuration_update", "reasoning": {"effort": "max"}}],
+                    reasoning={"effort": cap, "summary": "auto"})
+                record = self.route(body)
+                sent = routing.Edge.payloads[-1]
+                self.assertEqual(record["effort"], "low")
+                self.assertEqual(effective_effort(sent), "low")
+                self.assertEqual(sent["reasoning"]["summary"], "auto")
+                self.assertEqual(sent["input"][2], reasoning_item)
+                self.assertEqual(sent["input"][1], body["input"][1])
+                self.assertEqual(sent["input"][4], body["input"][4])
+                for item in sent["input"]:
+                    if item.get("type") == "configuration_update":
+                        self.assertNotIn("model", item)
+                        self.assertLessEqual(jev.EFFORTS.index(item["reasoning"]["effort"]), jev.EFFORTS.index(cap))
+
+    def test_missing_cap_defaults_legacy_aliases_and_invalid_cap_rejects_before_provider(self):
+        for mode, cap in jev.CLEF_DEFAULT_CAPS.items():
+            DecisionEndpoint.answer = clef_answer(jev.SOL, cap)
+            record = self.route(routing.payload_for([routing.message("user", "Continue.")], model=mode))
+            self.assertEqual(record["sol_effort_cap"], cap)
+            self.assertEqual(effective_effort(routing.Edge.payloads[-1]), cap)
+        calls = len(DecisionEndpoint.requests)
+        for reasoning in ({"effort": "unsupported"}, {"effort": 3}, "high", ["high"]):
+            body = routing.payload_for([routing.message("user", "Continue.")], reasoning=reasoning)
+            self.assertEqual(self.request(body=body)[0], 400)
+        self.assertEqual(len(DecisionEndpoint.requests), calls)
+
+    def test_all_caps_bound_technical_off_shadow_and_mocked_historical_leases(self):
+        for cap in jev.EFFORTS:
+            body = routing.payload_for([routing.message("user", "Continue.")], reasoning={"effort": cap})
+            legacy = jev.decision_from_answers(routing.answer(jev.SOL, "max")["answers"])
+            with mock.patch.object(jev, "route_lease", return_value=legacy):
+                record = self.route(body)
+            self.assertEqual((record["model"], record["effort"]), (jev.SOL, cap))
+            self.assertEqual(effective_effort(routing.Edge.payloads[-1]), cap)
+            DecisionEndpoint.status = 503
+            record = self.route(body)
+            self.assertEqual(record["decision_source"], "technical_fallback")
+            self.assertLessEqual(jev.EFFORTS.index(effective_effort(routing.Edge.payloads[-1])), jev.EFFORTS.index(cap))
+            DecisionEndpoint.status = 200
+            for sentinel in (jev.OFF_PATH, jev.SHADOW_PATH):
+                Path(sentinel).touch()
+                try:
+                    record = self.route(body)
+                finally:
+                    Path(sentinel).unlink()
+                self.assertEqual((record["model"], record["effort"]), (jev.SOL, cap))
+                self.assertEqual(effective_effort(routing.Edge.payloads[-1]), cap)
+
+    def test_every_cap_bounds_empty_recovery_and_quota_fallback_effective_effort(self):
+        for cap in jev.EFFORTS:
+            for failure in ("empty_completion", "quota", "manual_dry"):
+                with self.subTest(cap=cap, failure=failure):
+                    served = []
+
+                    def forward(handler, payload, path, stream, debug, marker, model, signature, effort,
+                                exact_route=False):
+                        served.append((model, effort, effective_effort(payload), exact_route))
+                        first = len(served) == 1 and failure != "manual_dry"
+                        status = (429 if failure == "quota" else 502) if first else 200
+                        handler._attempts.append({"model": model, "status": status,
+                            "completion": failure if first else "response.completed",
+                            "terminal_type": None if first else "response.completed"})
+                        return status, "json", "application/json", first and failure == "quota", b"{}", None
+
+                    DecisionEndpoint.answer = clef_answer(jev.LUNA, "max")
+                    body = routing.payload_for([routing.message("user", "Continue."),
+                        {"type": "configuration_update", "model": jev.ASTRA, "reasoning": {"effort": "max"}}],
+                        reasoning={"effort": cap})
+                    with mock.patch.object(jev.Handler, "_forward", new=forward), \
+                         mock.patch.object(jev, "fallback_candidates", return_value=[jev.ASTRA, jev.SOL]), \
+                         mock.patch.object(jev, "native_dry", return_value="manual" if failure == "manual_dry" else None):
+                        self.route(body)
+                    self.assertEqual([model for model, _, _, _ in served],
+                                     [jev.SOL] if failure == "manual_dry" else [jev.LUNA, jev.SOL])
+                    for model, effort, actual, exact in served:
+                        self.assertTrue(exact)
+                        self.assertEqual(effort, actual)
+                        if model == jev.SOL:
+                            self.assertLessEqual(jev.EFFORTS.index(actual), jev.EFFORTS.index(cap))
+                        else:
+                            self.assertEqual(actual, "max")
+
     def test_all_modes_preserve_both_models_and_bound_final_replayed_effort(self):
         for mode, profile in jev.CLEF_MODES.items():
             for model, requested in ((jev.LUNA, "max"), (jev.SOL, "low")):
                 with self.subTest(mode=mode, model=model):
-                    DecisionEndpoint.answer = routing.answer(model, requested)
+                    DecisionEndpoint.answer = clef_answer(model, requested)
                     update = {"type": "configuration_update", "model": jev.ASTRA,
                               "reasoning": {"effort": "max" if requested == "low" else "low"}}
                     body = routing.payload_for([routing.message("user", "Continue."), update],
@@ -317,7 +540,7 @@ class ClefRoutingWorkflow(unittest.TestCase):
         self.assertNotIn("x-codex-router-exact-route", routing.Edge.headers_seen[-1])
 
     def test_mode_switch_does_not_reuse_lease_and_keeps_cache_scope_shared(self):
-        DecisionEndpoint.answer = routing.answer(jev.LUNA, "max", lease="user_turn")
+        DecisionEndpoint.answer = clef_answer(jev.LUNA, "max", lease="user_turn")
         opening = [routing.message("user", "Complete this focused task.")]
         cheap = self.route(routing.payload_for(opening, model="auto-cheap"))
         continuation = opening + [routing.tool_call("c1"), routing.tool_step("c1", "OK")]
@@ -333,7 +556,7 @@ class ClefRoutingWorkflow(unittest.TestCase):
 
     def test_successful_diagnostic_words_keep_lease_but_nonzero_status_reconsiders(self):
         opening = [routing.message("user", "Inspect these logs.")]
-        DecisionEndpoint.answer = routing.answer(jev.LUNA, "low", lease="user_turn")
+        DecisionEndpoint.answer = clef_answer(jev.LUNA, "low", lease="user_turn")
         self.route(routing.payload_for(opening, reasoning={"effort": "low"}))
 
         def continuation(code):
@@ -383,7 +606,7 @@ class ClefRoutingWorkflow(unittest.TestCase):
         self.assertNotIn(raw, json.dumps(record))
 
     def test_verified_checks_reconsider_leases_and_feed_actual_outcomes_to_clef(self):
-        DecisionEndpoint.answer = routing.answer(jev.LUNA, "low", lease="user_turn")
+        DecisionEndpoint.answer = clef_answer(jev.LUNA, "low", lease="user_turn")
         items = [routing.message("user", "Fix the failing unit test and verify it.")]
         self.route(routing.payload_for(items))
         initial = jev.feedback_for(jev.STATE).context("pck-thread-1")
@@ -397,8 +620,8 @@ class ClefRoutingWorkflow(unittest.TestCase):
                       {"type": "function_call_output", "call_id": call_id,
                        "output": json.dumps({"exit_code": code,
                                              "output": "FAILED (failures=1)" if code else "Ran 1 test\nOK"})}]
-            DecisionEndpoint.answer = routing.answer(jev.SOL if code else jev.LUNA,
-                                                     "max" if code else "low", lease="user_turn")
+            DecisionEndpoint.answer = clef_answer(jev.SOL if code else jev.LUNA,
+                                                 "medium" if code else "low", lease="user_turn")
             record = self.route(routing.payload_for(items))
             self.assertEqual(record["decision_source"], "clef")
             self.assertEqual(record["verification"]["outcome"], "fail" if code else "pass")
@@ -407,7 +630,7 @@ class ClefRoutingWorkflow(unittest.TestCase):
             self.assertEqual(context["recent_verification"], record["verification"])
             self.assertEqual(sum(row["verified_failures"] for row in context["route_statistics"]), min(number, 2))
             self.assertEqual(sum(row["verified_passes"] for row in context["route_statistics"]), int(not code))
-            self.assertEqual(record["effort"], "max" if code else "low")
+            self.assertEqual(record["effort"], "medium" if code else "low")
 
         requests = len(DecisionEndpoint.requests)
         replay = self.route(routing.payload_for(items))
@@ -541,7 +764,7 @@ class ClefRoutingWorkflow(unittest.TestCase):
                                                   "terminal_type": None if first else "response.completed"})
                         return status, "json", "application/json", first and failure == "quota", b"{}", None
 
-                    DecisionEndpoint.answer = routing.answer(jev.LUNA, "max")
+                    DecisionEndpoint.answer = clef_answer(jev.LUNA, "max")
                     body = routing.payload_for([routing.message("user", "Continue.")], model=mode)
                     with mock.patch.object(jev.Handler, "_forward", new=forward), \
                          mock.patch.object(jev, "fallback_candidates", return_value=[jev.SOL]):
@@ -552,21 +775,25 @@ class ClefRoutingWorkflow(unittest.TestCase):
                     self.assertTrue(all(exact_route for _, _, _, exact_route in served))
                     self.assertIn(record["effort"], profile["efforts"])
 
-    def test_models_surface_and_health_describe_three_modes(self):
+    def test_models_surface_has_one_auto_and_health_describes_sol_ceiling(self):
         status, raw = self.request("/v1/models")
         self.assertEqual(status, 200)
         entries = json.loads(raw)["data"]
-        self.assertEqual({entry["id"] for entry in entries}, set(jev.CLEF_MODES))
-        self.assertEqual({entry["name"] for entry in entries},
-                         {"Auto Cheap (Clef)", "Auto Standard (Clef)", "Auto Deep (Clef)"})
+        self.assertEqual({entry["id"] for entry in entries}, {"auto"})
+        self.assertEqual({entry["name"] for entry in entries}, {"Auto (Clef)"})
         _, raw = self.request("/health")
         self.assertEqual(json.loads(raw)["auto_modes"]["auto"]["efforts"], list(jev.EFFORTS))
-        self.assertEqual(json.loads(raw)["effort_policy"], "adaptive-v1")
+        health = json.loads(raw)
+        self.assertEqual(health["effort_policy"], "sol-cap-v1")
+        self.assertEqual(health["luna_efforts"], list(jev.EFFORTS))
+        self.assertEqual(health["sol_effort_caps"], list(jev.EFFORTS))
+        self.assertEqual(health["default_sol_effort_cap"], "medium")
+        self.assertEqual(health["legacy_sol_effort_caps"], {"auto-cheap": "low", "auto-deep": "high"})
 
     def test_historical_mandatory_astra_is_capped_to_sol_in_active_mode(self):
         DecisionEndpoint.answer = routing.answer(jev.LUNA, "high", astra_required=True)
         record = self.route()
-        self.assertEqual((record["model"], record["effort"]), (jev.SOL, "high"))
+        self.assertEqual((record["model"], record["effort"]), (jev.SOL, "medium"))
         self.assertEqual(record["gate"], "clef_sol_ceiling")
         self.assertEqual(record["decision_source"], "clef")
 
@@ -579,7 +806,7 @@ class ClefRoutingWorkflow(unittest.TestCase):
         self.assertEqual(DecisionEndpoint.requests, [])
 
     def test_replayed_configuration_updates_cannot_reintroduce_astra(self):
-        DecisionEndpoint.answer = routing.answer(jev.SOL, "high")
+        DecisionEndpoint.answer = clef_answer(jev.SOL, "medium")
         reasoning_update = {"type": "configuration_update", "model": jev.ASTRA,
                             "reasoning": {"effort": "high"}}
         model_only_update = {"type": "configuration_update", "model": jev.ASTRA}
@@ -590,7 +817,7 @@ class ClefRoutingWorkflow(unittest.TestCase):
         self.assertTrue(self.logged.wait(3))
         sent = routing.Edge.payloads[-1]
         self.assertEqual(sent["model"], jev.SOL)
-        self.assertEqual(sent["input"][0], {"type": "configuration_update", "reasoning": {"effort": "high"}})
+        self.assertEqual(sent["input"][0], {"type": "configuration_update", "reasoning": {"effort": "medium"}})
         self.assertEqual(len(sent["input"]), 2)
         self.assertNotIn(jev.ASTRA, json.dumps(sent))
 

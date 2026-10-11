@@ -5,21 +5,28 @@ Apache-2.0 open-weight decision model, through llama.cpp's native System One
 endpoint. Clef selects the execution model and reasoning effort; Codex work still
 runs on your signed-in ChatGPT plan. There is no hosted Jev request in this profile.
 
-The model picker exposes three effort preferences, all selecting between **Luna
-and Sol**. Astra is blocked in every profile. Every profile allows **low, medium,
-high, xhigh and max** reasoning. Clef chooses sufficient effort for the current
-work; profiles guide that decision without imposing a floor or a range:
+The Codex picker exposes **Auto (Clef)** (`jev/auto`). Its effort selector sets
+the **maximum GPT-6.1 Sol effort**, with medium as the default. **GPT-6 Luna can
+use low, medium, high, xhigh or max at every selector setting.** Astra is blocked.
 
-| Profile | Picker ID | Effort preference | Picker default |
-|---|---|---|---|
-| Auto Cheap (Clef) | `jev/auto-cheap` | Prefer low; increase when difficulty or failures justify more care | low |
-| Auto Standard (Clef) | `jev/auto` | Balance care and cost at sufficient effort | medium |
-| Auto Deep (Clef) | `jev/auto-deep` | Prefer careful reasoning for difficult decisions; keep trivial work low | high |
+| Selected effort | Luna choices | Sol choices |
+|---|---|---|
+| low | All five efforts | low |
+| medium | All five efforts | low, medium |
+| high | All five efforts | low, medium, high |
+| xhigh | All five efforts | low, medium, high, xhigh |
+| max | All five efforts | All five efforts |
 
-Standard retains `jev/auto` for existing conversations. The picker defaults are
-UI hints; Clef can select any supported effort in every mode. Deep can select
-Luna at low effort for a trivial task, and Cheap can select higher effort when
-the work warrants it. Preferences do not establish token budgets or usage savings.
+Clef jointly chooses a model and effort from the permitted pairs, balancing
+sufficient capability against total task cost and measured cache evidence.
+Increasing the ceiling expands its choices without forcing higher effort or
+removing Luna. A low ceiling can still select Luna at max, so the selector is
+not an overall token or latency budget. No combinations are removed on the
+assumption that one effort name implies better capability than another model.
+
+The old `jev/auto-cheap` and `jev/auto-deep` routes remain hidden aliases for
+existing conversations, defaulting to a low or high Sol ceiling respectively.
+An explicitly selected effort takes precedence over those defaults.
 
 ## Build and download
 
@@ -63,7 +70,7 @@ session. `--smoke` sends one real request and consumes ChatGPT quota. Omit it fo
 installation without a live request. The installer validates the running Clef
 profile either way; readiness alone does not prove end-to-end routing.
 
-Fully quit and reopen Codex when convenient, then select an Auto profile. The
+Fully quit and reopen Codex when convenient, then select Auto (Clef). The
 installer preserves your existing default model, agent preferences, and unrelated
 settings. It disables installation of the router's optional helper skill pack and
 automatic agent concurrency defaults. Those opt-outs are forwarded to the macOS
@@ -127,15 +134,17 @@ JEV_BASELINE_MODEL=gpt-6.1-sol
 ```
 
 Clef execution is restricted to **Luna and Sol; Astra is disabled**. Its classifier
-asks only for Luna/Sol capability, reasoning effort and a route lease. Sol handles
+asks for a joint model/effort choice and a route lease. Sol handles
 architecture and final or risk-focused review. A hard dispatch ceiling also caps
 historical Astra decisions and leases, configured baselines, shadow/kill-switch
 routes and empty-completion recovery at Sol. Replayed configuration updates cannot
 override the selected execution model or the selected adaptive effort. Clef
 requests also disable the parent router's cooldown rerouting and provider failover,
 so it cannot replace the chosen model or effort. A technical classifier/provider
-error uses Sol at medium effort in every mode and never retries through hosted
-Jev. Explicit test or check failures inform the next adaptive decision. Quota
+error uses Sol at medium effort, bounded by the selected Sol ceiling, and never
+retries through hosted Jev. The ceiling also applies to cached routes, recovery
+attempts and inline reasoning updates; changing it invalidates the route lease.
+Explicit test or check failures inform the next adaptive decision. Quota
 fallbacks accept only explicit Luna/Sol IDs; opaque provider aliases are excluded, so exhausted native usage may
 return an error instead of selecting another provider. Upstream behavior is
 unchanged when `JEV_DECISION_PROVIDER` is omitted.
@@ -199,8 +208,8 @@ reset llama.cpp's idle timer.
 ```sh
 curl -fsS http://127.0.0.1:4319/health
 JEV_DECISION_PROVIDER=clef python3 server/smoke.py --model jev/auto
-JEV_DECISION_PROVIDER=clef python3 server/smoke.py --model jev/auto-cheap
-JEV_DECISION_PROVIDER=clef python3 server/smoke.py --model jev/auto-deep
+JEV_DECISION_PROVIDER=clef python3 server/smoke.py --sol-effort-cap low
+JEV_DECISION_PROVIDER=clef python3 server/smoke.py --sol-effort-cap high
 ```
 
 A successful smoke receipt reports `decision_source: clef`, matching `model` and
@@ -214,9 +223,9 @@ or memory guarantees for another model or machine.
 The local validation also completed a real function-call/tool-result continuation
 with a model change from Sol to Luna between calls. Automated checks cover local
 credentials, redirects, routing failures, the no-Astra ceiling, and preserved settings.
-On 2026-10-10, all 296 server tests passed. The adaptive profile was deployed and
-all three live Auto smoke requests selected Luna at low effort for `Reply only OK`,
-including Deep. HTTP checks also cover failed/pass outcomes, replay deduplication,
+On 2026-10-10, all 296 server tests passed. The previous adaptive profiles were
+deployed and their three live smoke requests selected Luna at low effort for
+`Reply only OK`. HTTP checks also cover failed/pass outcomes, replay deduplication,
 lease reconsideration, rapid tool-result handoffs, and disconnected attempt costs.
 
 Clef logs are in `~/Library/Logs/clef-flash.{out,err}.log`; adapter logs use

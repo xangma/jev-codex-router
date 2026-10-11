@@ -17,7 +17,7 @@ import urllib.request
 
 REPO = Path(__file__).resolve().parent.parent
 LABEL = "com.xangma.clef-flash"
-PICKER_MODELS = ("jev/auto-cheap", "jev/auto", "jev/auto-deep")
+PICKER_MODELS = ("jev/auto",)
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -274,9 +274,9 @@ def main():
     if args.smoke:
         run(sys.executable, REPO / "server/smoke.py")
     print(json.dumps({"installed": "clef", "model": "jev/auto", "models": list(PICKER_MODELS),
-                      "display": "Auto Standard (Clef)", "models_preset": str(preset_file),
+                      "display": "Auto (Clef)", "models_preset": str(preset_file),
                       "sleep_idle_seconds": args.sleep_idle_seconds,
-                      "next": "Restart Codex when convenient, then select Auto Cheap, Standard, or Deep (Clef)."}))
+                      "next": "Restart Codex when convenient, then select Auto (Clef). Effort sets the maximum Sol effort; Luna can use any effort."}))
 
 
 if __name__ == "__main__":

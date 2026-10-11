@@ -1,4 +1,4 @@
-"""Publish Clef mode metadata idempotently in an isolated user-model overlay."""
+"""Publish one Clef picker and preserve hidden legacy routes idempotently."""
 import json
 import os
 from pathlib import Path
@@ -15,7 +15,10 @@ class ConfigureAutoModes(unittest.TestCase):
             models_path = Path(directory, "user-models.json")
             other = {"slug": "other/model", "provider": "other", "displayName": "Keep me",
                      "reasoningLevels": [{"effort": "low", "description": "User setting"}]}
-            models_path.write_text(json.dumps({"version": 1, "models": [other]}))
+            old = [{"slug": slug, "provider": "jev", "listed": True,
+                    "displayName": "Old auto mode"}
+                   for slug in ("jev/auto-cheap", "jev/auto", "jev/auto-deep")]
+            models_path.write_text(json.dumps({"version": 1, "models": [other, *old]}))
             env = {**os.environ, "CODEX_ROUTER_STATE_DIR": directory,
                    "MODEL_ROUTER_USER_MODELS": str(models_path), "JEV_DECISION_PROVIDER": "clef"}
             command = ["node", str(ROOT / "server/configure-model.mjs")]
@@ -28,16 +31,21 @@ class ConfigureAutoModes(unittest.TestCase):
             efforts = ["low", "medium", "high", "xhigh", "max"]
             profiles = {
                 "jev/auto-cheap": ("auto-cheap", "Auto Cheap (Clef)", "low"),
-                "jev/auto": ("auto", "Auto Standard (Clef)", "medium"),
+                "jev/auto": ("auto", "Auto (Clef)", "medium"),
                 "jev/auto-deep": ("auto-deep", "Auto Deep (Clef)", "high"),
             }
             self.assertEqual(len(models), 4)
+            self.assertEqual([entry["slug"] for entry in models[1:] if entry["listed"]], ["jev/auto"])
             for entry in models[1:]:
                 upstream, name, default_effort = profiles[entry["slug"]]
                 self.assertEqual(entry["upstreamModel"], upstream)
                 self.assertEqual(entry["displayName"], name)
                 self.assertEqual([value["effort"] for value in entry["reasoningLevels"]], efforts)
                 self.assertEqual(entry["defaultEffort"], default_effort)
+                self.assertEqual(entry["listed"], entry["slug"] == "jev/auto")
+                self.assertIn("maximum Sol effort", entry["description"])
+                self.assertTrue(all("Luna may use any effort" in level["description"]
+                                    for level in entry["reasoningLevels"]))
                 self.assertNotIn("Astra", entry["description"])
                 self.assertNotIn("through", entry["description"])
             self.assertEqual(models_path.stat().st_mode & 0o777, 0o600)
